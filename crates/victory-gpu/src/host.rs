@@ -5980,11 +5980,10 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            #[cfg(feature = "diagnostics")]
-            marks.push((lists.len(), crate::copystat::Timed::Compare));
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST. Buffers
+        // decay to COMMON between ExecuteCommandLists calls, so submit
+        // the compare separately before signalling this submission's fence.
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6027,6 +6026,9 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6085,6 +6087,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6104,8 +6109,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
-            // With timing on each group is one of `runs` (and the compare
-            // of copies in the card's memory, with the last): every
+            // With timing on each group is one of `runs`: every
             // command's time on the card goes to the sums by pipeline.
             // The list's time from its sending to the card's signal, by what
             // it is, and of a run's the part its noted commands account for.
