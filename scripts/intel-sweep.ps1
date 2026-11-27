@@ -5,6 +5,9 @@
 # "survived" when the game had got into the world (frames of 100 ms and more), else "no world":
 # that run says nothing, run it again. A run that ends sooner is reported with how it ended. Every run writes its own log
 # and memory timeline in logs\ (play-intel-lowmem.ps1 does that); the table is saved there too.
+# Table columns from the run's last statistics: MedianMs (world frames), Waiting (texture slots waiting for room),
+# Unmapped (passed over: the title had unmapped their memory), LateS (mean seconds a texture waited for memory),
+# MinFreeGB / PeakGB (the PC's lowest free RAM and the game's peak working set, from the .mem.csv).
 #   -Only base,skip-fsr4   run just those
 #   -List                  show the settings and stop
 # Close big programs first: the launcher refuses to start under its free-RAM floor, and the sweep
@@ -141,6 +144,37 @@ function Get-OurGame {
         Where-Object { $_.Path -and $_.Path.StartsWith((Join-Path $repo 'target'), [StringComparison]::OrdinalIgnoreCase) }
 }
 
+# What a run's log says about textures and memory, from its last statistics (the sweep's table columns).
+function Get-RunStats([string]$path) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $text = [IO.File]::ReadAllText($path)
+    $last = { param($rx) $m = [regex]::Matches($text, $rx); if ($m.Count) { $m[$m.Count - 1] } else { $null } }
+    $r = [ordered]@{ Waiting = ''; Unmapped = ''; LateS = ''; MedianMs = ''; MinFreeGB = ''; PeakGB = '' }
+    $m = & $last 'textures picked by index: (\d+) uploaded so far \((\d+) MB\), (\d+) waiting, (\d+) passed over unmapped'
+    if ($m) { $r.Waiting = [int]$m.Groups[3].Value; $r.Unmapped = [int]$m.Groups[4].Value }
+    $m = & $last 'the same after waiting for memory: (\d+), mean (\d+) ms'
+    if ($m) { $r.LateS = [math]::Round([double]$m.Groups[2].Value / 1000, 0) }
+    # world frames only (the front end's are 33 ms): the median of the logged ms a frame
+    $ms = @([regex]::Matches($text, '([0-9.]+) fps, ([0-9.]+) ms/frame') |
+        ForEach-Object { [double]::Parse($_.Groups[2].Value, $inv) } | Where-Object { $_ -ge 100 } | Sort-Object)
+    if ($ms.Count) { $r.MedianMs = [math]::Round($ms[[int][math]::Floor(($ms.Count - 1) / 2)], 0) }
+    $csv = [IO.Path]::ChangeExtension($path, '.mem.csv')
+    if (Test-Path $csv) {
+        $free = @(); $ws = @()
+        foreach ($row in Import-Csv $csv) {
+            $w = 0.0
+            if ([double]::TryParse($row.victory_private_mb, [ref]$w) -and $w -ge 1000) {
+                $free += [double]$row.free_ram_mb; $ws += [double]$row.victory_ws_mb
+            }
+        }
+        if ($free.Count) {
+            $r.MinFreeGB = [math]::Round(($free | Measure-Object -Minimum).Minimum / 1024, 1)
+            $r.PeakGB = [math]::Round(($ws | Measure-Object -Maximum).Maximum / 1024, 1)
+        }
+    }
+    [pscustomobject]$r
+}
+
 $rows = @()
 $n = 0
 foreach ($name in $names) {
@@ -179,7 +213,8 @@ foreach ($name in $names) {
     $result = if ($closed -and -not $o.World) { 'no world' } elseif ($closed) { 'survived' } else { $o.How }
     $secs = if ($closed) { $Seconds } else { $o.Seconds }
     Write-Host ("  {0}, {1} s, last frame {2}" -f $result, $secs, $o.LastFrame)
-    $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; Log = $log.Name }
+    $st = Get-RunStats $log.FullName
+    $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; MedianMs = $st.MedianMs; Waiting = $st.Waiting; Unmapped = $st.Unmapped; LateS = $st.LateS; MinFreeGB = $st.MinFreeGB; PeakGB = $st.PeakGB; Log = $log.Name }
     if ($n -lt $names.Count) { Start-Sleep -Seconds $PauseSeconds }
 }
 
