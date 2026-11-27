@@ -225,7 +225,9 @@ pub(crate) enum Timed {
     Title(usize),
     /// Ours in front of the lists, the steps done on the card.
     Steps,
-    /// The compare of copies in the card's memory, behind the lists.
+    /// The compare of copies in the card's memory, behind the lists. (It goes to the queue by
+    /// itself now, after the lists' state has decayed: its time is no longer told apart.)
+    #[allow(dead_code)]
     Compare,
     /// Another of ours (the timeline's stamps).
     Other,
