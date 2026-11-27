@@ -50,6 +50,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod twin;
+#[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
 mod port;

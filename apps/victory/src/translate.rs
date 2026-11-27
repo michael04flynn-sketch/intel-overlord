@@ -495,6 +495,21 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
+    // `VICTORY_MESH_TWIN_TRANSLATE=1`: the mesh programs as their compute
+    // twins (`docs/intel-arc.md`), to count and validate them.
+    if std::env::var_os("VICTORY_MESH_TWIN_TRANSLATE").is_some_and(|v| v == "1") {
+        return emit::with_twin(|| translate_program(source, path, seen, t, checks));
+    }
+    translate_program(source, path, seen, t, checks)
+}
+
+fn translate_program(
+    source: &Source,
+    path: &Path,
+    seen: &Mutex<HashSet<blake3::Hash>>,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
@@ -737,6 +752,21 @@ fn check(
             format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
             &shader.dxil,
         );
+    }
+    // `VICTORY_MESH_TWIN_VS=1`: the vertex shader that would draw a mesh
+    // program's compute twin, built from the mesh program and validated.
+    if shader.stage == HwStage::Ms && std::env::var_os("VICTORY_MESH_TWIN_VS").is_some_and(|v| v == "1") {
+        match host::twin_vs(&shader) {
+            Ok(mut vs) => {
+                if let Some(v) = checks.validator.as_mut()
+                    && let Err(text) = v.validate(&mut vs.dxil)
+                {
+                    let first = text.lines().find(|l| l.contains("error")).unwrap_or("").to_owned();
+                    t.fail(format!("twin vertex shader: {first}"), &label);
+                }
+            }
+            Err(e) => t.fail(format!("twin vertex shader: {e}"), &label),
+        }
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {

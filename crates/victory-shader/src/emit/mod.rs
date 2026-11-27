@@ -121,9 +121,9 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    ARENA_BYTES, ARENA_GROUPS, ARENA_VERTICES, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ARENA, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    arena_groups, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -408,6 +408,32 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         }
         other => other,
     }
+}
+
+/// Runs `f` with the mesh programs it translates built as compute twins (see
+/// [`translate_twin`]), for tools that run the stages themselves
+/// (`victory.exe translate` with `VICTORY_MESH_TWIN_TRANSLATE=1`).
+pub fn with_twin<R>(f: impl FnOnce() -> R) -> R {
+    lower::with_twin(f)
+}
+
+/// [`translate`] for a mesh program as its **compute twin** (`VICTORY_MESH_TWIN`,
+/// `docs/intel-arc.md`): the same lowering, a compute program (`numthreads` the
+/// mesh program's lanes) whose group `g` stores the vertices and primitive
+/// indices the mesh program would export into the root UAV [`SLOT_ARENA`] (its
+/// layout is that constant's), for a vertex shader to draw. Nothing else
+/// changes: the same user data, descriptors and root views. Refused for a
+/// program that is not a mesh program.
+pub fn translate_twin(container: &[u8]) -> Result<HostShader, ShaderError> {
+    let mut shader = lower::with_twin(|| translate(container))?;
+    if shader.stage != HwStage::Ms {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a compute twin of a program that is not a mesh program",
+        });
+    }
+    shader.stage = HwStage::Cs;
+    Ok(shader)
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -1993,6 +2019,53 @@ mod tests {
         }
     }
 
+    /// A mesh program as its compute twin (`VICTORY_MESH_TWIN`): the exports
+    /// are stores into the arena's root UAV, the module is compute, and
+    /// dxil.dll, where there is one, takes it.
+    #[test]
+    fn a_mesh_program_translates_as_its_compute_twin() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for prim in [TRIANGLE, TRIANGLE | EDGE_FLAGS | CULL] {
+            let ms = lower::with_twin(|| triangle_mesh(prim)).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            assert_eq!(ms.root_uavs, vec![SLOT_ARENA], "{prim:#x}: the arena is the only root UAV");
+            // The DXIL container's program kind (the part header's high half): 5 compute.
+            let dxil = Container::parse(&ms.dxil).expect("a container");
+            let part = dxil.part(FourCC::DXIL).expect("a DXIL part");
+            assert_eq!(u32::from_le_bytes(part.data[..4].try_into().unwrap()) >> 16, 5, "{prim:#x}: compute");
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// The vertex shader that draws a twin's arena has the mesh program's own
+    /// output signature, reads the arena through the root UAV, and dxil.dll
+    /// takes it.
+    #[test]
+    #[cfg(windows)]
+    fn the_vertex_shader_of_a_twin_has_the_mesh_programs_outputs() {
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let ms = triangle_mesh(TRIANGLE).expect("a mesh program");
+        let vs = super::host::twin_vs(&ms).expect("its vertex shader");
+        assert_eq!(vs.root_uavs, vec![SLOT_ARENA]);
+        let (mesh, twin) = (Container::parse(&ms.dxil).unwrap(), Container::parse(&vs.dxil).unwrap());
+        let outputs = |c: &Container| signature(c.part(FourCC::OSG1).expect("OSG1").data).unwrap();
+        assert_eq!(outputs(&mesh), outputs(&twin), "the outputs the pixel shader links to");
+        assert_eq!(super::host::twin_groups(&ms), Ok(super::arena_groups(16)));
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut vs.dxil.clone()).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
     /// A triangle mesh program on the host GPU and on WARP (where they have
     /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
     /// edge flags set as without them; with the culling bit, nothing is lit.
@@ -2069,6 +2142,59 @@ mod tests {
         }
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
+        }
+    }
+
+    /// A mesh program's compute twin and the vertex shader that draws its
+    /// arena, on WARP (never on the hardware device: this is the test that
+    /// must not touch the card's mesh pipeline): the triangle that covers the
+    /// target lights every texel as the mesh program's own draw does, with the
+    /// edge flags set or not, and the culled one lights none.
+    #[test]
+    #[cfg(windows)]
+    fn a_twin_draws_what_its_mesh_program_draws_on_warp() {
+        use super::host::{Host, TwinDraw};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else {
+            eprintln!("no SM 6.6 WARP device; skipped");
+            return;
+        };
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: constant_color(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        for (prim, culled) in [
+            (TRIANGLE, false),
+            (TRIANGLE | EDGE_FLAGS, false),
+            (TRIANGLE | EDGE_FLAGS | CULL, true),
+        ] {
+            let ms = triangle_mesh(prim).unwrap();
+            let mut twin = lower::with_twin(|| triangle_mesh(prim)).unwrap();
+            twin.stage = HwStage::Cs;
+            let vs = super::host::twin_vs(&ms).unwrap();
+            let compute = host.compute_pipeline(&twin).unwrap_or_else(|e| panic!("{prim:#x}: twin pipeline: {e}"));
+            let graphics = host.pipeline(&vs, &ps).unwrap_or_else(|e| panic!("{prim:#x}: drawing pipeline: {e}"));
+            let texels = host
+                .draw_twin(&TwinDraw { compute: &compute, graphics: &graphics, groups: 1, size: (16, 16) })
+                .unwrap_or_else(|e| panic!("{prim:#x}: draw: {e}"));
+            let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+            if culled {
+                assert_eq!(lit, 0, "{prim:#x}: a culled triangle lit texels");
+                continue;
+            }
+            assert!(
+                texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                "{prim:#x}: {lit} of 256 texels lit"
+            );
         }
     }
 

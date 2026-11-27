@@ -517,3 +517,116 @@ and no run here used one.
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
 - Which title memory kinds block `-InPlace` (`-Probe` logs a census 30 s and 150 s in).
 - Whether any change to the buffer-copy pass is needed or safe.
+
+## A compute twin for the mesh draws: the study (2026-11-27)
+
+Question: can the title's mesh draws be drawn on this card without the driver's mesh pipeline, which stops
+the card (26 of 27 runs that issued them), so that the nine draws in ten of a world frame that are missing
+come back? The idea: the same translated mesh program, built as a **compute twin** that writes its vertices
+and primitive indices into a buffer, then a vertex shader that reads that buffer (`SV_VertexID`) with the
+title's own pixel shader, one non-indexed draw per mesh draw. Everything below is offline: the title's files,
+the translator, and the logs of runs that did issue mesh draws; no game run was made for it.
+
+### What the world frame needs
+
+- Frame 2796 of the capture of 15:35 (`frames-20261127-153511\frame-2796-ops.txt` in `intel-overlord`, 4,629
+  op lines): 898 `DROPPED indirect kind 10` (`VICTORY_MESH_TEST=skip`). The title's indirect executions are
+  all **one record, no count buffer** (`indirect kind N max 1`: 173 kind 2 and 9 kind 1 in that frame, 87 and
+  77 in frame 3056): a mesh draw is one `DispatchMesh(x, y, z)` whose `x` a GPU pass wrote, and nothing the
+  title declares bounds `x`. The op list does not say which mesh shader a dropped draw had, nor its groups.
+- Groups, from the "indirect mesh dispatches" statistic of the runs that did issue them (13 one-second lines
+  in two runs, world frames: `victory-20261127-154020.log` and `intel-overlord`'s `145435`): **1,967 to
+  10,461 groups a frame** (median 6,154), the largest single record **449 groups** (median of the per-second
+  largest 228). That is about 7 groups a draw over 898 draws. The host's clamp runs a record of more than
+  65,535 groups empty, and a list's budget is 2^27 threads, 2^20 mesh groups.
+- Per group, from the 489 mesh programs the logs show the title creating pipelines for (564 pipelines,
+  470 with a pixel shader, 94 depth-only; translated offline with `VICTORY_TRANSLATE_ONLY=<those hashes>`
+  and `VICTORY_EMIT_DUMP`, read with `scripts\mesh-census.py`): **all 489 are 128 threads, 128 vertices, 128
+  primitives**, no per-primitive outputs. A lane writes its own vertex and its own primitive and the
+  translator always declares the maxima (`mesh_prologue`), so a group's output is a fixed block. Vertex
+  scalars per vertex: 4 to 68, median 25; 84 programs (17 %) write a position alone; 27 write a clip distance.
+
+| What one thread group writes (128 vertices as 4-byte scalars + 128 triangles as 3 x u32) | Bytes |
+|---|---|
+| smallest (position only) | 3,584 |
+| median | 14,336 |
+| mean | 13,972 |
+| 90th percentile | 27,648 |
+| largest (68 scalars) | 36,352 |
+
+### The buffer
+
+| | smallest shader | mean (13,972 B) | largest shader for every group (36,352 B) |
+|---|---|---|---|
+| a frame of 1,967 groups | 7 MB | 27 MB | 72 MB |
+| the median frame, 6,154 groups | 22 MB | 86 MB | 224 MB |
+| the largest frame seen, 10,461 groups | 38 MB | 146 MB | 380 MB |
+| the largest record seen, 449 groups | 1.6 MB | 6.3 MB | 16.3 MB |
+| a record at the clamp's limit, 65,535 groups | 0.23 GB | 0.92 GB | 2.4 GB |
+| a list's budget, 2^20 groups | 3.8 GB | 14.7 GB | 38 GB |
+
+- **A worst case sized from what the title declares does not exist**: no count buffer, no maximum; the
+  groups are whatever a GPU pass wrote, up to the clamp. A static buffer for the clamp's limit is 0.9 to
+  2.4 GB a draw, for the list's budget 15 to 38 GB. No-go as a design: the buffer has to be sized by us.
+- **The memory is the PC's**: the process is 17.5 to 19.5 GB private in the world, and the free RAM of the 3
+  world runs with a timeline went down to 0.2, 0.3 and 1.0 GB of 31.4 GB. A buffer for a whole frame (146 MB
+  for the largest frame seen, 380 MB at the ceiling) would be a sixth to all of that floor, and the card's
+  texture budget comes from the same free RAM. A buffer **reused by each draw** (the twin's dispatch, a UAV
+  barrier, the draw that reads it, a UAV barrier, the next draw) needs only the largest single record: 16.3 MB
+  at the largest shader, so a **32 MB arena** (923 groups at the largest shader, 2,401 at the mean; a draw
+  that does not fit is left out and counted) is 3 to 16 % of that floor. The vertex shader can read the arena
+  through a root UAV, so it stays in the unordered-access state and only UAV barriers are needed.
+- **Allocation is on the GPU**: the group count is in GPU memory, so the host's clamp pass (which already
+  reads that record) would also write the twin's two argument records (`Dispatch(x, 1, 1)` and
+  `DrawInstanced(x * 384, 1, 0, 0)`) into the scratch buffer the executions read, with no extra pass or state.
+  No compaction is needed: a draw owns the arena from offset 0, and a primitive a lane culls is three zero
+  indices (degenerate, no pixels).
+- **Traffic** at the median frame: 86 MB written by the twin and 236 MB read by the vertex shader (6,154 x 384
+  corners, about 100 bytes each, no post-transform reuse), against the 275 to 337 ms the world frame takes
+  without mesh draws: a few ms of memory bandwidth. The cost is the commands: about 5 more per mesh draw
+  (clamp, dispatch, draw, two barriers), about 4,500 a frame.
+
+### Attributes against the title's pixel shaders
+
+- Every one of the **470 pipelines with a pixel shader** the logs show links: each pixel input that is not a
+  rasteriser value is an output of the same mesh program with the same semantic, index, register and mask
+  (`scripts\mesh-census.py`: 0 not covered). A vertex shader that declares the mesh program's own output
+  signature and passes the values through links the same way; the pixel shader is the title's, unchanged.
+- The pixel shaders' system-value inputs are all the rasteriser's, as in a mesh pipeline: position (442 of 442
+  programs), barycentrics (224), front face (105), clip distance (30). None reads `SV_PrimitiveID`.
+- Winding and provoking vertex are the draw's: the indices are the mesh program's own triples, and the
+  rasteriser state is the pipeline's.
+
+### What the translator and host have to do
+
+- Translator (`victory-shader`, `emit/lower.rs`): lower the same program as compute (`numthreads(128,1,1)`,
+  the lane and group ids it already has) with the export writing into a raw UAV block of the arena instead of
+  `storeVertexOutput`/`emitIndices` (vertex `v` of group `g` at `g*128+v`, 4 bytes a scalar in `OSG1` element
+  order; the indices as arena vertex numbers; a culled primitive as zeros), and a vertex shader built from
+  the same element list (`stub_vs` in `emit/host.rs` and `rect.rs` already build shaders from nothing). About
+  35 places read `s.mesh.is_some()` and mean "lanes are the console's, exports are per lane".
+- Host (`victory-gpu`): a compute pipeline and a vertex+pixel pipeline made beside the mesh pipeline from the
+  title's graphics state (`pipeline/host.rs` makes both kinds already), the arena, the clamp writing the two
+  records, and the bind of the mesh stage's resources as compute: `bind(list, p, compute)` takes the title's
+  state from `self.compute` or `self.graphics` by the same flag that picks the `SetCompute*` call, so the twin
+  can run with the graphics roots copied over the compute roots for its dispatch.
+
+### Verdict
+
+**Go, as a staged prototype**: the memory (with an arena a draw reuses), the matching and the command count
+do not stop it; the translator and host changes are about a thousand lines in two crates. One thing the
+figures cannot say, and it decides whether the drawing is worth finishing:
+
+1. **Does the twin avoid the hang?** Stage A: the compute twin of a few shaders runs for every mesh draw of
+   those shaders and writes the arena, nothing is drawn. If the card still stops, it is the shaders' code or
+   what they read, not the driver's mesh pipeline, and stages B and C are not worth building (that is a
+   finding for the session hunting the cause too). If it lives for 200 s in the world, the mesh pipeline is
+   the suspect.
+2. Stage B: the vertex shader and the draw for the same shaders; the first captured frames are compared with
+   the current ones (`intel-sweep.ps1 -Capture`).
+3. Stage C: all shaders, and direct dispatches (`x` known on the CPU).
+
+Not known: whether stage A lives (the whole point); how the groups divide between shaders in a world frame
+(the op list does not name the shader of a dropped draw: it takes a run that issues them); whether some mesh
+programs use group-shared memory or barriers in a way a compute lowering breaks (all 489 are 128 lanes, and
+`mesh_prologue` already refuses cross-lane operations); the cost of the barriers per draw.

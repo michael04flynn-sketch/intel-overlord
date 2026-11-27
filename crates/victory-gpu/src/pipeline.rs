@@ -61,6 +61,12 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// A mesh program's compute twin (`crate::twin`): `stage` is "compute",
+    /// the container the mesh program's; or the vertex shader that draws what
+    /// the twin stored: `stage` is "vertex", made from the mesh program's
+    /// translation.
+    #[cfg(windows)]
+    twin: Twin,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -118,6 +124,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                twin: Twin::No,
+                #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
@@ -126,6 +134,73 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// What a shader is a twin of (`crate::twin`).
+#[cfg(windows)]
+enum Twin {
+    No,
+    /// The mesh shader as compute.
+    Compute,
+    /// The vertex shader for what the compute twin of this mesh shader stored.
+    Vertex(Arc<Shader>),
+}
+
+/// The compute twin of the mesh shader `ms` (`crate::twin`): the same
+/// container, translated as compute with the exports stored into the arena.
+#[cfg(windows)]
+pub(crate) fn twin_of(ms: &Arc<Shader>) -> Arc<Shader> {
+    static TWINS: Mutex<Option<HashMap<String, Arc<Shader>>>> = Mutex::new(None);
+    let mut twins = TWINS.lock().unwrap_or_else(|e| e.into_inner());
+    twins
+        .get_or_insert_with(HashMap::new)
+        .entry(ms.hash.clone())
+        .or_insert_with(|| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: ms.hash.clone(),
+                container: ms.container.clone(),
+                twin: Twin::Compute,
+                ambient: None,
+                probe: None,
+                translated: OnceLock::new(),
+            })
+        })
+        .clone()
+}
+
+/// The vertex shader that draws what the compute twin of the mesh shader `ms`
+/// stored (`crate::twin`).
+#[cfg(windows)]
+pub(crate) fn twin_vertex_of(ms: &Arc<Shader>) -> Arc<Shader> {
+    static TWINS: Mutex<Option<HashMap<String, Arc<Shader>>>> = Mutex::new(None);
+    let mut twins = TWINS.lock().unwrap_or_else(|e| e.into_inner());
+    twins
+        .get_or_insert_with(HashMap::new)
+        .entry(ms.hash.clone())
+        .or_insert_with(|| {
+            Arc::new(Shader {
+                stage: "vertex",
+                hash: ms.hash.clone(),
+                container: Vec::new(),
+                twin: Twin::Vertex(ms.clone()),
+                ambient: None,
+                probe: None,
+                translated: OnceLock::new(),
+            })
+        })
+        .clone()
+}
+
+/// The title's pipeline `this`: its shaders and graphics state, for the
+/// twin's drawing pipeline (`crate::twin`).
+#[cfg(windows)]
+pub(crate) fn parts<'a>(this: This) -> Option<(&'a [Arc<Shader>], &'a host::GraphicsState)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    Some((&p.shaders, p.host.graphics.as_deref()?))
 }
 
 /// A translated shader and the console resources its code reads.
@@ -155,7 +230,11 @@ impl Shader {
             .get_or_init(|| {
                 let done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
-                    translate(&self.container)
+                    match &self.twin {
+                        Twin::No => translate(&self.container, false),
+                        Twin::Compute => translate(&self.container, true),
+                        Twin::Vertex(ms) => translate_vertex_twin(ms),
+                    }
                 };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -204,8 +283,25 @@ impl Shader {
     }
 }
 
+/// The vertex shader for the compute twin of the mesh shader `ms`.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate_vertex_twin(ms: &Shader) -> Result<Translated, String> {
+    let mesh = ms.translated().ok_or("the mesh program does not translate")?;
+    let host = victory_shader::emit::host::twin_vs(&mesh.host)?;
+    let tables = crate::draw::TablePlan::new(&[], &host.root_indexed_views);
+    Ok(Translated {
+        host,
+        threads: None,
+        used: Vec::new(),
+        tables,
+        stores: false,
+        stores_by_address: false,
+        picks: Default::default(),
+    })
+}
+
+#[cfg(windows)]
+fn translate(container: &[u8], twin: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -214,10 +310,17 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // (A twin is translated on its own, not through the cache: a handful of
+    // programs, behind a setting.)
+    let host = if twin {
+        victory_shader::emit::translate_twin(container).map_err(|e| e.to_string())?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        victory_shader::native::StageIo::Ms(ms) if twin => Some([ms.threads, 1, 1]),
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);

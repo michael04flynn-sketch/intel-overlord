@@ -321,6 +321,8 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Twin: `SV_GroupID.x`, the draw's group number (entry block).
+    twin_group: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1562,6 +1564,38 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
 }
 
 thread_local! {
+    /// Whether a mesh program is built as its compute twin ([`with_twin`]).
+    static TWIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with mesh programs built as compute twins
+/// (`VICTORY_MESH_TWIN`): the program is lowered as the mesh program it is,
+/// its exports stored into the arena ([`super::shader::SLOT_ARENA`]) in
+/// place of `storeVertexOutput` and `emitIndices`.
+pub(super) fn with_twin<R>(translate: impl FnOnce() -> R) -> R {
+    let before = TWIN.replace(true);
+    let result = translate();
+    TWIN.set(before);
+    result
+}
+
+/// The scalar each element of a mesh program's vertex outputs begins at in a
+/// twin's vertex record (four bytes a scalar), and the scalars in all: the
+/// elements by register, then by first component. The vertex shader that
+/// reads the record derives the same from the program's `OSG1`.
+pub(super) fn twin_layout(elements: &[SigElement]) -> (Vec<u32>, u32) {
+    let mut order: Vec<usize> = (0..elements.len()).collect();
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col, i));
+    let mut offsets = vec![0; elements.len()];
+    let mut next = 0;
+    for i in order {
+        offsets[i] = next;
+        next += u32::from(elements[i].cols);
+    }
+    (offsets, next)
+}
+
+thread_local! {
     /// Whether a mask operation on numbers read as data is the number it
     /// computes ([`with_mask_ops_on_numbers`]).
     static MASK_OPS_ON_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1996,6 +2030,7 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            s.twin = TWIN.get();
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -2118,6 +2153,7 @@ impl<'a> Lower<'a> {
             partial_active: None,
             wave_base: None,
             flat: None,
+            twin_group: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -5218,8 +5254,10 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if !self.s.twin {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
         let z = self.s.m.i32(0);
         // Every primitive of the declared count starts culled, also those
@@ -5237,6 +5275,17 @@ impl<'a> Lower<'a> {
             };
             let guard = ((pass + 1) * threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            if self.s.twin {
+                let ok = self.twin_ok();
+                let guard = Some(match guard {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, ok),
+                    None => ok,
+                });
+                let at = self.begin_guarded(guard);
+                self.twin_indices(index, [z, z, z]);
+                self.end_guarded(at, &[]);
+                continue;
+            }
             let at = self.begin_guarded(guard);
             self.s.op(
                 self.cur,
@@ -5249,6 +5298,66 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// Twin: the group's number in the draw (`SV_GroupID.x`; the title's
+    /// own group number, `Input::MeshGroup`, is this times the mesh stride).
+    fn twin_group(&mut self) -> V {
+        if let Some(g) = self.twin_group {
+            return g;
+        }
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        self.twin_group = Some(g);
+        g
+    }
+
+    /// Twin: the arena vertex number of the group's vertex 0, `group * 128`.
+    fn twin_first_vertex(&mut self) -> V {
+        let g = self.twin_group();
+        let seven = self.s.m.i32(7);
+        self.s.m.bin(self.cur, Bin::Shl, g, seven)
+    }
+
+    /// Twin: the bytes of one vertex of the arena's record, from the vertex
+    /// outputs the program declares.
+    fn twin_stride(&self) -> u32 {
+        4 * twin_layout(&self.s.outputs).1.max(1)
+    }
+
+    /// Twin: whether the group's number is one the arena has room for (the
+    /// groups past it write nothing).
+    fn twin_ok(&mut self) -> V {
+        let g = self.twin_group();
+        let cap = self.s.m.i32(super::shader::arena_groups(self.twin_stride()));
+        self.s.m.cmp(self.cur, pred::IULT, g, cap)
+    }
+
+    /// Twin: stores one to four dwords at byte `at` of the arena.
+    fn arena_store(&mut self, at: V, values: &[V]) {
+        let arena = self.s.root_uav_handle(super::shader::SLOT_ARENA);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut args = vec![arena, at, iu];
+        args.extend(values);
+        args.resize(7, iu);
+        args.push(self.s.m.i8((1u8 << values.len()) - 1));
+        args.push(self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+    }
+
+    /// Twin: the three corners of primitive `primitive` of this group
+    /// (numbers in the group's vertices), stored as arena vertex numbers.
+    fn twin_indices(&mut self, primitive: V, corners: [V; 3]) {
+        let c = self.cur;
+        let first = self.twin_first_vertex();
+        let of = self.s.m.bin(c, Bin::Add, first, primitive);
+        let twelve = self.s.m.i32(12);
+        let at = self.s.m.bin(c, Bin::Mul, of, twelve);
+        let values = corners.map(|k| self.s.m.bin(c, Bin::Add, first, k));
+        self.arena_store(at, &values);
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -12956,6 +13065,16 @@ impl<'a> Lower<'a> {
             } else {
                 guard
             };
+            // Twin: the groups the arena has no room for write nothing.
+            let mesh_guard = if self.s.twin {
+                let ok = self.twin_ok();
+                Some(match mesh_guard {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, ok),
+                    None => ok,
+                })
+            } else {
+                mesh_guard
+            };
             self.begin_guarded(mesh_guard)
         } else {
             None
@@ -12980,9 +13099,27 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
-            let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            elements(self, primitive)[id].usage |= 1 << col;
+            if self.s.twin {
+                // The element's scalar in the vertex record of the arena.
+                if primitive {
+                    return Err("a per-primitive output of a compute twin");
+                }
+                let (offsets, scalars) = twin_layout(&self.s.outputs);
+                let scalar = offsets[id] + u32::from(col);
+                let c = self.cur;
+                let first = self.twin_first_vertex();
+                let lane = self.mesh_thread();
+                let vertex = self.s.m.bin(c, Bin::Add, first, lane);
+                let stride = self.s.m.i32(4 * scalars);
+                let at = self.s.m.bin(c, Bin::Mul, vertex, stride);
+                let begin = self.s.m.i32(super::shader::ARENA_VERTICES + 4 * scalar);
+                let at = self.s.m.bin(c, Bin::Add, at, begin);
+                self.arena_store(at, &[x]);
+                continue;
+            }
+            let comp = elements(self, primitive)[id].comp;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13040,6 +13177,16 @@ impl<'a> Lower<'a> {
         } else {
             guard
         };
+        // Twin: the groups the arena has no room for write nothing.
+        let guard = if self.s.twin {
+            let ok = self.twin_ok();
+            Some(match guard {
+                Some(g) => self.s.m.bin(self.cur, Bin::And, g, ok),
+                None => ok,
+            })
+        } else {
+            guard
+        };
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
@@ -13062,6 +13209,12 @@ impl<'a> Lower<'a> {
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
             }
             *slot = i;
+        }
+        if self.s.twin {
+            let corners = indices.map(|i| self.s.m.select(c, culled, z, i));
+            self.twin_indices(flat, corners);
+            self.end_guarded(at, &[]);
+            return Ok(());
         }
         let mut args = vec![flat];
         for i in indices {

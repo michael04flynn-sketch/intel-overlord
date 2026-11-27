@@ -26,7 +26,8 @@ param(
     [string[]]$Only,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$Launcher,
-    # Every run also saves frames as PNG files (logs\frames-<time>\; the launcher's -Capture).
+    # Each run saves PNG frames of the world (and the frames' op lists) to logsrames-<time>\<setting>\
+    # (VICTORY_CAPTURE, VICTORY_CAPTURE_WORLD; the launcher's -Capture does the same for one run).
     [switch]$Capture,
     [switch]$List
 )
@@ -57,6 +58,14 @@ $experiments = [ordered]@{
     # between draws), and with no groups in the dispatch (a hang that stays is in the pipeline's state)
     'shadows-fence'     = @{ MeshTest = 'only:05393503e72397a3,45ace4127ac61cfd,d42a640660651285,f507ff49d4aadd4b'; More = @{ VICTORY_MESH_FENCE = '1' } }
     'shadows-zero'      = @{ MeshTest = 'only:05393503e72397a3,45ace4127ac61cfd,d42a640660651285,f507ff49d4aadd4b'; More = @{ VICTORY_MESH_ZERO = '1' } }
+    # the mesh programs as compute twins (VICTORY_MESH_TWIN, docs/intel-arc.md, "A compute twin"): stage A runs
+    # each mesh draw's program as compute, storing its vertices and indices in an arena, and draws nothing (a run
+    # that still hangs says the hang is in what the programs do and read, not in the mesh pipeline); stage B draws
+    # the arena with a vertex shader and the title's pixel shader; the third is stage B for the four shadow
+    # cascade programs alone
+    'twin'         = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all' } }
+    'twin-draw'    = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all'; VICTORY_MESH_TWIN_DRAW = '1' } }
+    'twin-shadows' = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = '05393503e72397a3,45ace4127ac61cfd,d42a640660651285,f507ff49d4aadd4b'; VICTORY_MESH_TWIN_DRAW = '1' } }
     # nothing is ever let go (host copies of title buffers and textures stay): if the hang goes, a view in
     # the heap that a shader picks by an index reads memory the host had given back
     'no-sweep'     = @{ More = @{ VICTORY_SWEEP = '0'; VICTORY_TEXTURE_SWEEP = '0' } }
@@ -213,8 +222,17 @@ foreach ($name in $names) {
     # Mesh draws on, unless the setting says otherwise: the host skips them on an Intel GPU by default.
     $splat = @{ Exe = $Exe; Build = $Build; MeshTest = 'off' }
     if ($PSBoundParameters.ContainsKey('MinFreeGB')) { $splat['MinFreeGB'] = $MinFreeGB }
-    if ($Capture) { $splat['Capture'] = $true }
     foreach ($k in $experiments[$name].Keys) { $splat[$k] = $experiments[$name][$k] }
+    if ($Capture) {
+        if (-not $frames) { $frames = Join-Path $logs ('frames-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+        $more = @{}
+        if ($splat['More']) { foreach ($k in $splat['More'].Keys) { $more[$k] = $splat['More'][$k] } }
+        $more['VICTORY_CAPTURE'] = Join-Path $frames $name
+        $more['VICTORY_CAPTURE_WORLD'] = '1'
+        $more['VICTORY_CAPTURE_WORLD_ALSO'] = '60,120,180,240,300,400,500'
+        New-Item -ItemType Directory -Force -Path $more['VICTORY_CAPTURE'] | Out-Null
+        $splat['More'] = $more
+    }
     $started = Get-Date
     $job = Start-Job -ScriptBlock { param($launcher, $splat) & $launcher @splat } -ArgumentList $Launcher, $splat
     $cap = $started.AddSeconds($Seconds)

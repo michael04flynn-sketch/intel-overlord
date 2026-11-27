@@ -65,6 +65,33 @@ pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// The root UAV `u<SLOT_ARENA>` of a mesh program's compute twin
+/// (`VICTORY_MESH_TWIN`): the buffer the twin writes the vertices and
+/// primitive indices of a draw's thread groups into, and the vertex shader
+/// that draws them reads. Ours: the host binds it, the title has no such
+/// view. Layout (the twin's group number `g` is `SV_GroupID.x`, lane `n` of
+/// it writes vertex `n` and primitive `n`):
+///
+/// - indices, from byte 0: group `g`, primitive `n`, corner `k` at
+///   `(g * 128 + n) * 12 + 4k`, the arena vertex number (`g * 128 + vertex`);
+///   a culled primitive is that group's vertex 0 three times;
+/// - vertices, from [`ARENA_VERTICES`]: group `g`, vertex `n` at
+///   `ARENA_VERTICES + (g * 128 + n) * stride`, `stride` four bytes a scalar
+///   of the program's vertex outputs, in the order of [`twin_layout`].
+pub const SLOT_ARENA: u8 = 252;
+/// Bytes of the arena the twins and the vertex shaders share.
+pub const ARENA_BYTES: u32 = 32 << 20;
+/// Where the vertices begin in the arena: room for [`ARENA_GROUPS`] groups of
+/// indices (1,536 bytes each).
+pub const ARENA_VERTICES: u32 = ARENA_GROUPS * 1536;
+/// The most groups of one draw the arena takes, whatever their size.
+pub const ARENA_GROUPS: u32 = 2048;
+/// A twin's groups of one draw that fit the arena, for vertices of `stride`
+/// bytes: past them a group writes nothing (and the draw is the shorter).
+pub const fn arena_groups(stride: u32) -> u32 {
+    let room = (ARENA_BYTES - ARENA_VERTICES) / (128 * stride);
+    if room < ARENA_GROUPS { room } else { ARENA_GROUPS }
+}
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
@@ -233,6 +260,10 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// The mesh shader as a compute program (`VICTORY_MESH_TWIN`): it is
+    /// lowered as a mesh shader (`mesh` set, lanes are the console's) and
+    /// finished as compute, its exports stored into [`SLOT_ARENA`].
+    pub twin: bool,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
@@ -297,6 +328,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            twin: false,
             geometry: None,
             user_data: 0,
             samplers: 0,
@@ -553,6 +585,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.twin {
+            // A compute program: no mesh state, no signatures (the exports
+            // are stores into the arena).
+            self.mesh = None;
+            self.outputs.clear();
+            self.prims.clear();
+        }
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.

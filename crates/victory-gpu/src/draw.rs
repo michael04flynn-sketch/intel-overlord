@@ -1578,6 +1578,12 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        self.prepare_with(list, p, indexed, mesh)
+    }
+
+    /// [`State::prepare_for`] with the host pipeline `p` (the title's own,
+    /// or the drawing pipeline of a mesh program's compute twin).
+    fn prepare_with(&mut self, list: &HostList, p: &HostPipeline, indexed: bool, mesh: bool) -> bool {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
@@ -1911,6 +1917,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_ARENA {
+                    // Ours: where a mesh program's compute twin stores what
+                    // it would export (`crate::twin`).
+                    if let Some((_, gpu)) = crate::twin::arena() {
+                        // SAFETY: an open list; the arena lives as long as the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3396,6 +3417,19 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // A program that runs as a compute twin (`crate::twin`): its dispatch
+        // stores the vertices and indices in the arena (and a vertex shader
+        // draws them, with `VICTORY_MESH_TWIN_DRAW=1`).
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && crate::twin::wanted(p)
+        {
+            if !self.twin_run(list, p, None, x) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -4091,6 +4125,99 @@ impl State {
         Some((scratch, at))
     }
 
+    /// Binds the compute twin of the mesh pipeline `p` (`crate::twin`) for a
+    /// dispatch: the mesh stage's resources are the title's graphics roots,
+    /// which the twin reads as its compute roots, and the arena. The twin, or
+    /// `None` if it cannot run (nothing is bound then).
+    fn twin_bind(&mut self, list: &HostList, p: &HostPipeline) -> Option<&'static crate::twin::Made> {
+        let made = crate::twin::pipeline(p)?;
+        crate::twin::arena()?;
+        self.window = None;
+        let graphics = self.graphics.clone();
+        let compute = std::mem::replace(&mut self.compute, graphics);
+        let bound = self.bind(list, &made.compute, true);
+        self.compute = compute;
+        if !bound {
+            return None;
+        }
+        // Earlier twins' stores to the arena first.
+        crate::twin::barrier(&list.list);
+        Some(made)
+    }
+
+    /// A mesh draw of a program that runs as a compute twin (`crate::twin`).
+    /// Stage A: the twin's dispatch stores the draw's vertices and indices
+    /// in the arena. Stage B (`VICTORY_MESH_TWIN_DRAW=1`): then a vertex shader
+    /// draws them with the title's pixel shader and state. `record` is the GPU
+    /// address of the title's mesh record (indirect), else `direct` its groups.
+    /// False if it cannot run (the draw is dropped).
+    fn twin_run(&mut self, list: &HostList, p: &HostPipeline, record: Option<u64>, direct: u32) -> bool {
+        const DRAW: u32 = 0;
+        const DISPATCH: u32 = 2;
+        let l = &list.list;
+        let (Some(made), Some(dispatch), Some(draw)) = (crate::twin::pipeline(p), host_signature(DISPATCH, 12), host_signature(DRAW, 16))
+        else {
+            return false;
+        };
+        let drawn = if crate::twin::draws() { made.draw(self.pipeline as This) } else { None };
+        if crate::twin::draws() && drawn.is_none() {
+            return false;
+        }
+        let cap = made.cap;
+        if let Some(record) = record {
+            // The arguments, from the title's record: groups clamped to the arena.
+            if !crate::twin::prepare(l, record, cap) {
+                return false;
+            }
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+        let Some(made) = self.twin_bind(list, p) else {
+            if record.is_some() {
+                crate::twin::release(l);
+            }
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh twin {} groups{}", record.map_or(direct, |_| 0), if drawn.is_some() { " drawn" } else { "" }), false));
+        // SAFETY: an open list with everything set; the arguments are readable.
+        unsafe {
+            match record {
+                Some(_) => l.ExecuteIndirect(&dispatch, 1, crate::twin::arguments().expect("made"), 0, None, 0),
+                None => l.Dispatch(direct.min(cap), 1, 1),
+            }
+        }
+        crate::twin::barrier(l);
+        let mut ok = true;
+        if let Some(draw_p) = drawn {
+            ok = self.prepare_with(list, draw_p, false, false);
+            if ok {
+                const TRIANGLE_LIST: i32 = 4;
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(TRIANGLE_LIST));
+                    match record {
+                        Some(_) => l.ExecuteIndirect(&draw, 1, crate::twin::arguments().expect("made"), 16, None, 0),
+                        None => l.DrawInstanced(direct.min(made.cap) * 3 * 128, 1, 0, 0),
+                    }
+                }
+                crate::twin::barrier(l);
+                if self.topology_set {
+                    self.set_topology(list, self.topology);
+                }
+                self.drew(list, Some(draw_p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.drew(list, Some(&made.compute));
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        }
+        if record.is_some() {
+            crate::twin::release(l);
+        }
+        ok
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -4178,7 +4305,10 @@ impl State {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+        // A mesh program that runs as a compute twin (`crate::twin`) is not
+        // a mesh draw: the card's mesh pipeline is not used for it.
+        let twin = kind == MESH && crate::twin::wanted(p);
+        if kind == MESH && !twin && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
@@ -4293,6 +4423,20 @@ impl State {
                 (bounded, 0)
             }
         };
+        if twin {
+            // The twin of the mesh program (`crate::twin`) in place of the
+            // mesh draw, from the title's record (the clamp above bounded
+            // the budget; the twin's own pass clamps to the arena).
+            // SAFETY: a live host buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            if !self.twin_run(list, p, Some(record), 0) {
+                why("the compute twin did not run");
+                return false;
+            }
+            return true;
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

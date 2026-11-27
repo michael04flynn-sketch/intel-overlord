@@ -430,6 +430,13 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_for(shaders, g, false)
+    }
+
+    /// As [`HostPipeline::new`]; `triangles`: the pipeline draws triangle
+    /// lists whatever topology the state names (a mesh pipeline's names none:
+    /// the vertex shader of its compute twin draws its triangles, `crate::twin`).
+    pub(crate) fn new_for(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, triangles: bool) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -539,7 +546,7 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
+                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_ARENA
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -778,6 +785,7 @@ impl HostPipeline {
             // The console's rectangle and quad types draw as triangles on
             // the host (see `draw`).
             PrimitiveTopologyType: match g.topology.0 {
+                _ if triangles => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 _ => g.topology,
             },
