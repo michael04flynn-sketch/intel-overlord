@@ -168,10 +168,11 @@ else {
         $now = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
         $size = (Get-Item $file).Length
         if ($now - $size / 1GB -lt 14) { Say ("   {0}: left out ({1:N1} GB free now, it is {2:N1} GB)" -f $name, $now, ($size / 1GB)); continue }
-        $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite', 'SequentialScan')
-        try { while ($fs.Read($buffer, 0, $buffer.Length) -gt 0) { } } finally { $fs.Dispose() }
-        $total += $size
-        Say ("   {0}: {1:N0} MB" -f $name, ($size / 1MB))
+        $fs = New-Object IO.FileStream($file, 'Open', 'Read', 'ReadWrite', 1MB, 'SequentialScan')
+        $got = 0
+        try { while (($n = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) { $got += $n } } finally { $fs.Dispose() }
+        $total += $got
+        Say ("   {0}: {1:N0} MB" -f $name, ($got / 1MB))
     }
     $clock.Stop()
     Say ("   {0:N2} GB read in {1:N1} s" -f ($total / 1GB), $clock.Elapsed.TotalSeconds)
