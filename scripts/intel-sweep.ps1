@@ -65,6 +65,14 @@ $experiments = [ordered]@{
     'all-three'    = @{ More = @{ VICTORY_CARD_BUFFERS = '0'; VICTORY_FALLBACK_HEAPS = '1'; VICTORY_NO_GETDIMS = '1' } }
     # memory against CPU time, with the host's default (no mesh draws: the settings that stay stable); compare
     # the frame times in the logs (scripts do not average them: `ms/frame` lines of the world)
+    # the settings VIctory-NVIDIA's launcher plays with (scripts/play.ps1 there: relay 2, copy queue,
+    # card steps, indirect batch, thin lists, joined copies...), with the host default for meshes
+    'nv-all'       = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1' } }
+    # the same without keeping the card's clocks up (a compute queue spinning between submissions: on an
+    # iGPU that shares the CPU's power budget it may cost more than it gives)
+    'nv-noawake'   = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_SHOW_AFTER = '1'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1' } }
+    # the indirect light stand-in the NVIDIA launcher turns on (80 %)
+    'ambient'      = @{ MeshTest = ''; More = @{ VICTORY_AMBIENT = '0.8' } }
     'lean'         = @{ Profile = 'Lean'; MeshTest = '' }
     'fast'         = @{ Profile = 'Fast'; MeshTest = '' }
     # the card's budget as the system gives it
