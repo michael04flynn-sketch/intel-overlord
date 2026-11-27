@@ -32,7 +32,7 @@ param(
     [switch]$Hold,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$Launcher,
-    # Each run saves PNG frames of the world (and the frames' op lists) to logsrames-<time>\<setting>\
+    # Each run saves PNG frames of the world (and the frames' op lists) to logs\frames-<time>\<setting>\
     # (VICTORY_CAPTURE, VICTORY_CAPTURE_WORLD; the launcher's -Capture does the same for one run).
     [switch]$Capture,
     [switch]$List
