@@ -6881,6 +6881,21 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| {
+            // SAFETY: a live texture.
+            let d = unsafe { depth.texture.GetDesc() };
+            format!(
+                "twin copy {} of a depth texture {}x{}x{} format {} flags {:#x}{}",
+                if colour { "depth to twin" } else { "twin to depth" },
+                d.Width,
+                d.Height,
+                d.DepthOrArraySize,
+                d.Format.0,
+                d.Flags.0,
+                if twin.through.is_some() { ", stencil plane through a buffer" } else { "" }
+            )
+        });
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
@@ -6940,6 +6955,20 @@ impl HostList {
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
             self.settle(&target.copy, COPY_SOURCE);
+            #[cfg(feature = "diagnostics")]
+            self.note_op(|| {
+                // SAFETY: a live texture.
+                let d = unsafe { target.copy.texture.GetDesc() };
+                format!(
+                    "copy-back of texture {:#x}: {}x{}x{} format {} mips {}",
+                    target.owner(),
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.Format.0,
+                    d.MipLevels
+                )
+            });
             if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);
             }

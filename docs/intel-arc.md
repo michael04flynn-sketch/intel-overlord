@@ -499,21 +499,175 @@ Newer Intel drivers: the release notes of 32.0.101.8991 (2026-08-25) list no mes
 device-removal fix for Core Ultra Series 3 (their known issues name three games only); those of
 32.0.101.8974 could not be fetched (HTTP 403). So a driver newer than 8724 is not known to cure the hang,
 and no run here used one.
+## The stress test with the title's load added (2026-11-27, evening)
+
+`crates\victory-gpu\tests\mesh_fuzz.rs` has a second test, `the_titles_load_around_a_mesh_shader`
+(`mesh_fuzz\load.rs`, `mesh_fuzz\hlsl.rs`; the switches are tabled at the top of `load.rs`), run one setting
+after another by `scripts\intel-fuzz.ps1` (`-List` shows them; every run starts a copy of the test named
+`victory.exe`, and the script holds that name with a placeholder for the whole list: `intel-sweep.ps1` refuses to
+start a game run next to a process of that name, so no game run starts on the card meanwhile). Reading the
+shadow shader's DXIL and the first test's setup showed what that test had not been doing:
+
+- **The root constants.** The shader reads only words 9 (the table's place in the heap) and 12 (bit 28 picks a
+  typed buffer through the heap by the word's low 10 bits). The test left word 12 at 0, so that path never ran.
+- **The slot it read.** The shader reads the meshlet view at the table's slot + 1; the test wrote its first view at the
+  table's slot, so that slot was never written.
+- **Real triangles.** Over garbage the translated shader rasterises next to nothing. The new test has a mesh
+  shader of our own (`hlsl.rs`: 128 vertices, 128 triangles a group, real depth, a position, a texture
+  coordinate and a normal) drawn with the title's targets.
+- **Everything else on the list**: depth and stencil formats (`D32_S8`, `D24_S8`, `D32`, `D16`), four colour
+  targets with a pixel shader, clears, the copy-back of the targets into write-back memory (and with
+  `MESH_COPYBACK=3` the host's depth-to-colour-twin copies, a stencil plane through a buffer, both ways), lists
+  in flight, a copy queue, a compute queue, textures made, copied into and released, a CPU rewriting the heap
+  (also the descriptors the draws read), many pipelines (states and programs of our own, and with
+  `MESH_DXIL_DIR` hundreds of the title's translated programs), `ExecuteIndirect` of mesh dispatches after the
+  host's kind of clamp pass, the million views written, memory held by the test, views that claim more than their
+  buffer holds, the CPU streaming memory.
+
+What it found: **no setting that ran to its end stopped the card.** 120 s each unless noted; the totals are the last
+line of each log (the test counts dispatches, 40 a list):
+
+| Setting | Adds | Result |
+|---|---|---|
+| `plain` | the first test's work in this harness (translated shadow shader over garbage) | no hang, 9.9 M dispatches |
+| `user` | root constants that vary by draw | no hang, 9.0 M |
+| `own` | our own program with real triangles | no hang, 7.4 M |
+| `targets` | `D32_S8`, 4 colour targets, a pixel shader, clears, copy-back, 3 lists in flight | no hang, 2.2 M |
+| `queues` | a copy queue and a compute queue at the same time | no hang, 5.1 M |
+| `heap` | textures made and copied, 141 million descriptor rewrites, all million views written | no hang, 5.0 M |
+| `race` | also the descriptors the draws read, rewritten while read | no hang, 5.1 M |
+| `pipes` | 780 pipelines (60 states of 13 programs) | no hang, 3.8 M |
+| `copies` | `MESH_COPYBACK=3` and stencil writes: each colour target copied to a texture of its own, and the depth copied to its colour twin and back after the draws (`D32_S8`: the stencil plane through a buffer, both ways) | no hang, 3.6 M |
+| `stats` (40 s) | `targets` with the card's own count of what it ran (pipeline statistics of each list) | no hang, 1.7 M dispatches; at 30 s the card had run 1.37 billion mesh invocations, as many primitives and 36 billion pixels (45 M mesh invocations a second): the dispatches do work |
+
+The progress lines of every other setting print the same "the card ran" column; it reads 0 there because the query is off
+(`MESH_STATS=1` turns it on), not because nothing ran.
+
+Cut short or never run, so **no result**: `copies-2` (a depth-stencil array of two slices, so that two twin copies sit
+between a pair of barriers as in the stuck lists) and `dred-plain` (the plainest setting with the test's own auto
+breadcrumbs) were stopped from outside after 30 of 120 s and 60 of 100 s; neither log has an error or a hang report, the
+log just ends. `mixed` (vertex draws between the mesh draws, indirect executions in batches, the two slices), `copies-d24`,
+`copies-d32`, `batch` (60 single-record `ExecuteIndirect`s in a row), `indirect`, `shaders` (up to 300 of the title's
+translated mesh programs in their own pipelines; the folder made for it had 294, from `victory.exe translate --validate
+--list` with `VICTORY_EMIT_DUMP` and `VICTORY_TRANSLATE_ONLY=<hashes>`), `oversize` (views claiming 256 MB more than their
+buffer holds), `pressure` (12 GB held), `memload` (the CPU streaming memory), `big` (dispatches of up to 216 groups),
+`dred-mixed` and `all` have no log: they compile, pass clippy and were not run.
+
+## The title's own runs, bisected (game, 2026-11-27 15:40 to 16:11, driver 8724, mesh draws on)
+
+`scripts\intel-sweep.ps1 -Hold` (new: `-Hold` keeps the card against other launchers' sweeps, `-Repeat n`, `-Only` in
+the order given) with the settings `base-dred`, `exact`, `only-ea2e`, `skip-ea2e`, `ind-zero`, `ind-fence`, `all-zero`
+(`-List`). One run each, 220 s:
+
+**A caveat on four of these runs.** Another session working on the same machine reported afterwards that it compiled
+(`cargo check`, `test` and one 37 s `build`) at times between 15:57 and 16:08, and ran a one-group mesh unit test on the
+hardware device at 16:12. The runs inside that window may have been perturbed by it (the rule on this machine is: no compile
+while a run is going): `ind-fence` (15:55:58 to 15:58:09, its last minute), `ind-zero` (15:58:32), `all-zero` (16:00:20) and
+`dred-off` (16:04:48), and the stress runs `stats`, `copies-2` and `dred-plain` above. The runs before it (`base-dred`,
+`exact` x3, `only-ea2e`, `skip-ea2e`: 15:40 to 15:54) and the one with the twin patch (16:10) were outside it, by that
+session's account. A hang in a perturbed run
+does not show that what the setting left in place is the cause, so the conclusions that rest on those rows are marked below
+and need the runs repeated on a quiet machine.
+
+| Setting | What it does | Result | First unfinished command (device-removed data) |
+|---|---|---|---|
+| `base-dred` | mesh draws on, `-Dred full` | hung 101 s | `CopyTextureRegion` 34 of list 209 (63 commands), after a barrier |
+| `exact` (3 runs) | `VICTORY_MESH_COUNTS=exact` | hung 89, 87, 72 s | `CopyTextureRegion` 31 of 46; then twice `ExecuteIndirect` 107 of 160 (`[mesh ea2eadde55090b27, pixel 3711fdad456538a1]`, 14 s after that pipeline's first bind) |
+| `only-ea2e` | only that mesh program's draws | **survived 220 s** | |
+| `skip-ea2e` | every mesh draw but that program's | hung 68 s | `ExecuteIndirect` 48, `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]` |
+| `ind-fence` | a barrier on all work after every indirect mesh execution | hung 131 s (its last minute in the window) | `CopyTextureRegion` 44 of 68, after a barrier |
+| `ind-zero` | every indirect mesh execution issued with a count of 0 | hung 73 s (in the window) | `CopyTextureRegion` 31 of list 244 |
+| `dred-off` | mesh draws on, `-Dred off` (no auto breadcrumbs at all) | hung 90 s (in the window) | none kept ("no breadcrumbs"); the device was removed after 11 submissions sent ahead |
+| `base`, the depth twins made to wait for their mapping | mesh draws on; `resource.rs` waits with `host::mapped` after `resident` for the two twin textures of a depth texture (see below); not kept | hung 81 s | `CopyTextureRegion` 43 of list 290 |
+| `all-zero` | every mesh draw empty: direct dispatches of 0 groups, indirect counts of 0, all state and bindings as before | **hung 68 s** (in the window) | `CopyBufferRegion` 58 of 60: the 16-byte copy of the card budget's notes into mapped memory, the last commands of a list (`card_budget_out`), between two barriers |
+
+What it says:
+
+- **The stop probably does not need a mesh shader to run (one run, to repeat).** With every mesh draw empty the card still
+  stopped (`all-zero`, in the window above; `ind-zero` agrees, also in it), while the standalone test, which runs 45 million
+  mesh invocations a second, never stopped it. If it holds, what the host does for the draws is left: pipelines, root
+  signatures, descriptors, the refresh and copies of what they read.
+- **The first unfinished command is, in 6 of the 9 reports of that evening (the 8 runs of the unpatched build above and
+  the 14:54 run of another; the run with the twin patch also stopped on a `CopyTextureRegion`), a copy that the host records, right after a `ResourceBarrier` that did finish** (so every draw
+  before it had finished): `CopyTextureRegion` (5; two between a pair of barriers each time), `CopyBufferRegion`
+  (1). In the other 3 it is a mesh `ExecuteIndirect`. The copies are the host's own (a depth texture's twin
+  through a buffer, a texture copied back, the card budget's notes); none is the title's (those carry a marker
+  text in `-Dred full`; the report says "no marker" for these).
+- **One mesh program alone does not do it; any larger set does** (`only-ea2e` lived, `skip-ea2e` died on another
+  program): the program stuck in two runs is where the 59th of 109 `ExecuteIndirect`s in a row (no barrier between,
+  how the host's batched clamp leaves them) fell, not a program that is wrong.
+- Not the output counts (`exact`: 3 of 3 hung, before the window). Probably not the overlap of indirect draws (`ind-fence`)
+  and not the device-removed data itself (`dred-off` hung with the auto breadcrumbs off), but each of those is one run, in
+  the window.
+- **A lead in the host's code that was tried and was not it.** `host::mapped` says new card memory is mapped into the
+  card's address space after `MakeResident` returns, a GPU access before that is a page fault (two losses of 2026-11-25),
+  and the host waits with a copy on a queue of its own. The 45 depth textures' twins (`resource.rs`) are made resident
+  but not waited for until mapped, and the stuck copies are the host's first uses of such twins, so the twins were made
+  to wait (a patch, run once, not kept): the run hung all the same. The depth twins are why mesh draws matter to the
+  copies: the title's depth-only shadow draws are mesh draws, and each depth texture they write is copied into its twin
+  and back at the list's end, empty draws included (`twin_use`, `twins_to_depth`); with the draws skipped no depth texture
+  is written by them and, by the code, none of those copies is recorded (not measured).
+
+## What a stopped run of the title says (the report of a run of 2026-11-27 14:54, mesh draws on, 74 s)
+
+The log of a `-MeshTest off` run (device removed data on, `-Dred light`) names the command that did not finish:
+list 169 of 63 commands, 40 done, the last of them a `ResourceBarrier` (op 15), the first not done a
+**`CopyTextureRegion` (op 8)**; the list binds seven mesh pipelines with pixel shaders (the title's skinned
+character and vehicle programs: `MSNC_VS_PedTransformSkinAlpha`, `MSR_VS_TransformSkin`, `MS_VS_Transform`,
+`MSNC_VS_WindshieldWiperMask`), a compute pipeline and two vertex pipelines. The other lists never started. Free RAM
+was 1.0 GB, but runs with the mesh draws skipped went down to 0.1 to 1.0 GB free and lived: not memory.
+
+The host copies depth textures into colour twins and back (`record_twin_copy`, `twin_use`: the title writes
+depth textures with compute, so each has a colour twin; a depth buffer with a stencil plane goes through a
+buffer, `CopyTextureRegion` both ways). The same run's log made 45 such depth textures between 20:55:20 and
+20:55:28, 19 s before the device went: 43 of format 53 (`R16_TYPELESS`: cube and spot shadow maps of 128 to
+1536 texels), one 1280x720 of the console's format 118 and one 1920x1080 `R32_TYPELESS`. A `CopyTextureRegion` of
+a depth or stencil plane after mesh and pixel shaders wrote the same buffer is the pattern `MESH_COPYBACK=3`
+adds to the test (the console's 16-bit depth with stencil has no PC format: `d32s8`, `d24s8`).
+
+## Exact output counts (`VICTORY_MESH_COUNTS=exact`)
+
+The console's mesh programs ask for their outputs with one lane's `s_sendmsg` GS_ALLOC_REQ (m0 = vertices |
+primitives << 12, made by a few scalar instructions from the meshlet's header; `(w & 127) + 1` and
+`((w >> 7) & 127) + 1` in the shadow shader, 1 and 1 for an invalid meshlet). DXIL wants one
+`SetMeshOutputCounts` in code every thread runs, so the translator declared the maxima (128, 128) at the start
+and culled the primitives past the real count (`mesh_prologue`). With `VICTORY_MESH_COUNTS=exact` the
+translator finds the one request in a block only lane 0 runs (`hoistable_alloc`), takes the instructions that make
+m0 (scalar moves, logic, shifts and adds over values the block before it holds) and lowers them at the end of that
+block (`hoist_counts`) for `SetMeshOutputCounts(vertices, primitives)` (never more than the maxima); the
+primitives up to the count start culled as before. A program of another shape keeps the maxima.
+Off by default; part of the shader cache's key. Offline, on the title's files: of 294 mesh programs (every 30th by
+name, 300 hashes; `victory.exe translate --validate --list`) all 294 change, and the same 291 validate as without it
+(the three that do not are the 32 KiB outputs `-MeshStrict` refuses); the shadow shader's DXIL has the counts
+before the lane-0 branch. **In the game it changed nothing**: three runs with it and mesh draws on hung at 89, 87 and
+72 s (table above). It stays off; it is kept as an experiment, and the offline check above shows the hoist is well
+formed.
 
 ## Not known yet
 
-- What the title's run has that the standalone test has not, and the hang needs: several queues at
-  once (the copy queues for textures and uploads), the real depth and colour targets (`D32_S8`,
-  `R16G16B16A16F` at 1280x720) and their pipelines' state, the pixel shaders, thousands of different
-  pipelines, real meshlet data, a view heap with a million views written, memory at 17 GB. The next
-  step is to add them to `mesh_fuzz.rs` one at a time, or to capture the list that stops
-  (`docs/replay.md`: too large in the world so far) and replay it standalone.
-- Whether a newer Intel graphics driver (8724 is from 2026-04) takes mesh shaders that this one does
-  not. The device-removed data names no page-fault address on this vendor.
-- `MS` programs write the declared maxima of vertices and primitives every time
-  (`SetMeshOutputCounts(128, 128)`, then culled triangles for the lanes past the real count): the
-  console's own counts could be passed instead, which also saves the GPU the empty primitives; whether
-  it matters here is untested.
+- **What the card stops on.** Not the output counts (3 of 3 runs, unperturbed) and not one program. Probably not the mesh
+  shaders' work (empty draws stop it), not DRED and not the overlap of indirect draws, but each of those three is one run made
+  while another session compiled (`all-zero`, `dred-off`, `ind-fence`). What the reports show is a copy the host records at
+  the end of a list, right after a barrier, that does not finish, once mesh draws have been prepared in the list (or a mesh
+  `ExecuteIndirect` in a long run of them).
+  Next steps: first repeat `all-zero`, `dred-off` and `ind-fence` three times each on a quiet machine
+  (`scripts\intel-sweep.ps1 -Only all-zero,dred-off,ind-fence -Repeat 3 -Seconds 220 -MinFreeGB 16.5 -Hold`, about half an
+  hour of the card); then `-Dred full` markers on every host copy (twin, copy-back, card budget; `host.rs` has them for the first two now)
+  to name the stuck one and its resources; a run with the depth twins switched off (`VICTORY_DEPTH_TWINS=nodepth` removes
+  only the depth plane's); an Intel driver newer than 8724 (Intel's download page lists newer 32.0.101 builds, 8991 WHQL and 8992 non-WHQL;
+  none is installed here); a report to Intel naming the copy once it is known.
+- What the title's run has that the standalone test has not. Run to the end, one setting at a time and 120 s each
+  (`scripts\intel-fuzz.ps1 -List`): a copy queue and a compute queue, the title's targets with a pixel shader, 780
+  pipelines, a heap rewritten while read, the twins' copies of a `D32_S8` depth; none stops the card, so the hang does
+  not need those. Written but not run (or run only 20 s, `smoke`): indirect executions, memory held near 17 GB, views
+  past the end of their buffers, vertex draws between the mesh draws, the title's own translated programs, a
+  two-slice depth-stencil twin, and everything together (`all`). Not in the test at all: the host's copies of title memory
+  into card buffers while the draws read them, and real meshlet data (the stuck lists can be captured with
+  `docs/replay.md` only below 17 GB).
+- Whether a newer Intel graphics driver (8724 is from 2026-04) changes it; the device-removed data names no
+  page-fault address on this vendor.
+- `MS` programs wrote the declared maxima of vertices and primitives every time; with
+  `VICTORY_MESH_COUNTS=exact` they pass the console's own counts, and the card stopped all the same (see above).
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
 - Which title memory kinds block `-InPlace` (`-Probe` logs a census 30 s and 150 s in).
 - Whether any change to the buffer-copy pass is needed or safe.

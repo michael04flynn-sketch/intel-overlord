@@ -8,7 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -611,6 +611,18 @@ fn mesh_flag(name: &'static str) -> bool {
         "VICTORY_MESH_ZERO" => flags[0],
         _ => flags[1],
     }
+}
+
+/// Experiments on indirect mesh executions (`VICTORY_MESH_INDIRECT`), the ones most of the title's mesh draws are:
+/// `zero` issues each with a count of 0 (the clamp and everything bound as before, nothing runs); `fence:<n>` puts a
+/// barrier on all work and memory after every n-th one. Off unless set.
+fn mesh_indirect() -> (bool, u32) {
+    static SET: std::sync::OnceLock<(bool, u32)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let value = std::env::var("VICTORY_MESH_INDIRECT").unwrap_or_default();
+        let fence = value.strip_prefix("fence:").and_then(|n| n.parse().ok()).unwrap_or(0);
+        (value == "zero", fence)
+    })
 }
 
 /// Which mesh draws `VICTORY_MESH_TEST` keeps (see [`mesh_kept`]).
@@ -4461,7 +4473,7 @@ impl State {
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                if kind == MESH && mesh_indirect().0 { 0 } else { max },
                 &bounded,
                 at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
@@ -4470,6 +4482,14 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+            // An experiment: nothing overlaps every n-th execution (`VICTORY_MESH_INDIRECT=fence:<n>`).
+            let fence = mesh_indirect().1;
+            if fence > 0 {
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % fence == fence - 1 {
+                    crate::host::sync_all(&list.list);
+                }
+            }
         }
         if kind == DISPATCH {
             self.buffers_written();

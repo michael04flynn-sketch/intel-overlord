@@ -121,6 +121,7 @@ fn build() -> [u8; 32] {
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_MESH_COUNTS",
             "VICTORY_NO_GETDIMS",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",

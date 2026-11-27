@@ -17,7 +17,21 @@
 //!
 //! It prints how many lists ran before the card stopped (or that none did). The card resets when it
 //! stops: the screen may flicker.
+//!
+//! A second test, `the_titles_load_around_a_mesh_shader`, adds what the title's run has and this one lacks
+//! (root constants that vary, real triangles, the title's targets and pixel shaders, more queues, a heap
+//! that is rewritten, many pipelines, indirect dispatches, memory pressure), a switch each: see `load.rs`.
+//!
+//! ```text
+//! MESH_DXIL=<file> MESH_OWN=1 MESH_USER=fuzz MESH_QUEUES=copy,compute,churn MESH_SECONDS=120 \
+//!   cargo test -p victory-gpu --test mesh_fuzz the_titles_load -- --ignored --nocapture
+//! ```
 #![cfg(windows)]
+
+#[path = "mesh_fuzz/hlsl.rs"]
+mod hlsl;
+#[path = "mesh_fuzz/load.rs"]
+mod load;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -939,4 +953,10 @@ fn a_translated_mesh_shader_over_garbage() {
             began.elapsed().as_secs_f64()
         );
     }
+}
+
+#[test]
+#[ignore = "runs programs on the PC's adapter until it stops them: the screen may flicker"]
+fn the_titles_load_around_a_mesh_shader() {
+    load::run();
 }

@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -325,6 +325,12 @@ struct Lower<'a> {
     twin_group: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Mesh, `VICTORY_MESH_COUNTS=exact`: where the allocation request's counts are set for the
+    /// group ([`hoistable_alloc`]); the prologue then declares nothing.
+    alloc_site: Option<AllocSite>,
+    /// Mesh: the declared maxima, kept for [`Lower::hoist_counts`] when the prologue left the
+    /// call to it.
+    hoist: Option<super::shader::Mesh>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
     /// branch lies between the entry and the block, or the program has a
     /// loop a lane can be cut out of): the barrier there keeps its fences
@@ -433,6 +439,111 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+
+/// Where a mesh program's allocation request (`s_sendmsg` GS_ALLOC_REQ) can have its counts set for the
+/// whole group: the console's request comes from lane 0 alone, after the counts were made by scalar
+/// instructions every lane could run, and DXIL wants one `SetMeshOutputCounts` in code every thread runs.
+#[derive(Clone, Debug)]
+struct AllocSite {
+    /// The block the request's own block follows (its closing branch is the one only lane 0 takes): all
+    /// lanes run it, and it holds every value the counts are made from.
+    dom: usize,
+    /// The block of the request, and the request's place in it.
+    block: usize,
+    at: usize,
+    /// The instructions of that block, before the request, that make M0: the counts, `vertices |
+    /// primitives << 12`. Scalar moves, logic, shifts and adds only.
+    slice: Vec<usize>,
+}
+
+/// The [`AllocSite`] of a mesh program, if its shape is the one the console compiler makes: one request, in a
+/// block only lane 0 runs, whose M0 comes from a few scalar instructions over values its dominator holds;
+/// every export after that dominator. `idom` and `order` are the program's immediate dominators and reverse
+/// postorder.
+fn hoistable_alloc(p: &Program, st: &Structured, idom: &[usize], order: &[usize]) -> Option<AllocSite> {
+    let is_request = |i: &Inst| {
+        i.name() == "s_sendmsg" && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+    };
+    let requests: Vec<(usize, usize)> = order
+        .iter()
+        .flat_map(|&b| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| is_request(i))
+                .map(move |(at, _)| (b, at))
+        })
+        .collect();
+    let [(block, at)] = requests[..] else {
+        return None;
+    };
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        if idom[b] == b || idom[b] == usize::MAX {
+            return false;
+        }
+        b = idom[b];
+    };
+    let dom = idom[block];
+    if dom == block || dom == usize::MAX {
+        return None;
+    }
+    // Every lane runs `dom`, and no export comes before it.
+    if !all_lane_blocks(st)?.get(dom).copied().unwrap_or(false) {
+        return None;
+    }
+    for &b in order {
+        let exports = p.blocks[b].insts.iter().any(|i| matches!(i.fields, Fields::Exp { .. }));
+        if exports && (b == dom || !dominates(dom, b)) {
+            return None;
+        }
+    }
+    // The block where each value is made (entry values: block 0).
+    let mut made: HashMap<Value, usize> = p.inputs.iter().map(|&(_, v)| (v, order[0])).collect();
+    for &b in order {
+        for phi in &p.blocks[b].phis {
+            made.insert(phi.value, b);
+        }
+        for i in &p.blocks[b].insts {
+            for w in &i.writes {
+                made.insert(w.1, b);
+            }
+        }
+    }
+    // The instructions that make M0, from values `dom` holds.
+    let insts = &p.blocks[block].insts;
+    let mut wanted = vec![insts[at].read(Reg::S(M0))?];
+    let mut slice: Vec<usize> = Vec::new();
+    while let Some(v) = wanted.pop() {
+        match (0..at).rev().find(|&i| insts[i].writes.iter().any(|w| w.1 == v)) {
+            None => {
+                // An input of the slice: it must be there at the end of `dom`.
+                if !dominates(*made.get(&v)?, dom) {
+                    return None;
+                }
+            }
+            Some(i) => {
+                if slice.contains(&i) {
+                    continue;
+                }
+                if !matches!(
+                    insts[i].name(),
+                    "s_mov_b32" | "s_or_b32" | "s_and_b32" | "s_lshl_b32" | "s_lshr_b32" | "s_add_i32" | "s_add_u32"
+                ) || !matches!(insts[i].fields, Fields::Sop { .. })
+                {
+                    return None;
+                }
+                wanted.extend(insts[i].reads.iter().filter(|r| r.0 != Reg::Scc).map(|r| r.1));
+                slice.push(i);
+            }
+        }
+    }
+    slice.sort_unstable();
+    Some(AllocSite { dom, block, at, slice })
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -2021,6 +2132,7 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        let mut alloc_site = None;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -2064,6 +2176,9 @@ impl<'a> Lower<'a> {
                 if ms.lds_bytes == 0 || dominated {
                     no_barrier.insert(b);
                 }
+            }
+            if super::mesh_counts_exact() {
+                alloc_site = hoistable_alloc(p, x.st, &idom, &order);
             }
         }
         Lower {
@@ -2155,6 +2270,8 @@ impl<'a> Lower<'a> {
             flat: None,
             twin_group: None,
             no_barrier,
+            alloc_site,
+            hoist: None,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -2880,6 +2997,9 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
                 self.lds_meeting();
+            }
+            if let Some(site) = self.alloc_site.clone().filter(|site| site.dom == b) {
+                self.hoist_counts(&site)?;
             }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
@@ -5248,6 +5368,13 @@ impl<'a> Lower<'a> {
             }
             self.s.mesh = Some(mesh);
         }
+        // `VICTORY_MESH_COUNTS=exact`: the counts are the request's own, set where the group
+        // makes them ([`Lower::hoist_counts`]), with the culling of the primitives past them.
+        if self.alloc_site.is_some() {
+            self.s.mesh = Some(mesh);
+            self.hoist = Some(mesh);
+            return Ok(());
+        }
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (
@@ -5358,6 +5485,72 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Mul, of, twelve);
         let values = corners.map(|k| self.s.m.bin(c, Bin::Add, first, k));
         self.arena_store(at, &values);
+    }
+
+    /// Mesh, `VICTORY_MESH_COUNTS=exact`: at the end of the block the request's block follows, the
+    /// counts the request will send (made here by the instructions of its slice, which only read values
+    /// this block holds) become `SetMeshOutputCounts`, as DXIL wants it: once, in code every thread
+    /// runs, before any output. The primitives past the count are not declared, so those the program
+    /// exports nothing for start culled only up to it.
+    fn hoist_counts(&mut self, site: &AllocSite) -> Result<(), Stop> {
+        let Some(mesh) = self.hoist.take() else {
+            return Ok(());
+        };
+        let x = self.x;
+        let insts = &x.p.blocks[site.block].insts;
+        let offset = insts[site.at].machine.offset;
+        for &i in &site.slice {
+            self.sop(&insts[i]).map_err(|w| unsupported(offset, w))?;
+        }
+        let m0 = insts[site.at]
+            .read(Reg::S(M0))
+            .ok_or_else(|| unsupported(offset, "an allocation request without counts"))?;
+        let Some(Val::I32(m0)) = self.vals.get(&m0).cloned() else {
+            return Err(unsupported(offset, "the counts of an allocation request"));
+        };
+        let c = self.cur;
+        let (k12, k_mask) = (self.s.m.i32(12), self.s.m.i32(0xFFF));
+        let vertices = self.s.m.bin(c, Bin::And, m0, k_mask);
+        let shifted = self.s.m.bin(c, Bin::LShr, m0, k12);
+        let primitives = self.s.m.bin(c, Bin::And, shifted, k_mask);
+        // Never more than the declared maxima.
+        let (max_v, max_p) = (self.s.m.i32(mesh.max_vertices), self.s.m.i32(mesh.max_primitives));
+        let over = self.s.m.cmp(c, pred::IUGT, vertices, max_v);
+        let vertices = self.s.m.select(c, over, max_v, vertices);
+        let over = self.s.m.cmp(c, pred::IUGT, primitives, max_p);
+        let primitives = self.s.m.select(c, over, max_p, primitives);
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            void,
+            168,
+            &[vertices, primitives],
+        );
+        let flat = self.mesh_thread();
+        let z = self.s.m.i32(0);
+        let threads = self.s.threads.expect("mesh")[0];
+        for pass in 0..mesh.max_primitives.div_ceil(threads.max(1)) {
+            let index = if pass == 0 {
+                flat
+            } else {
+                let past = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, past)
+            };
+            let guard = self.s.m.cmp(self.cur, pred::IULT, index, primitives);
+            let at = self.begin_guarded(Some(guard));
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[index, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
+        Ok(())
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and

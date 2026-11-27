@@ -9,6 +9,10 @@
 # Unmapped (passed over: the title had unmapped their memory), LateS (mean seconds a texture waited for memory),
 # MinFreeGB / PeakGB (the PC's lowest free RAM and the game's peak working set, from the .mem.csv).
 #   -Only base,skip-fsr4   run just those
+#   -Repeat n              run each of them n times (three runs of one setting in a row)
+#   -Hold                  wait for a game run that is on to end, then keep a placeholder process named victory.exe
+#                          alive for the whole sweep, so that no other launcher starts a game run on the card between
+#                          two of these runs
 #   -List                  show the settings and stop
 # Close big programs first: the launcher refuses to start under its free-RAM floor, and the sweep
 # then stops. Each run may reset the GPU (a device removal): the screen can go black for a second.
@@ -24,6 +28,8 @@ param(
     # Passed to the launcher as -MinFreeGB when given (its default is 23).
     [double]$MinFreeGB,
     [string[]]$Only,
+    [int]$Repeat = 1,
+    [switch]$Hold,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$Launcher,
     # Each run saves PNG frames of the world (and the frames' op lists) to logsrames-<time>\<setting>\
@@ -80,6 +86,28 @@ $experiments = [ordered]@{
     'fallback-heaps' = @{ More = @{ VICTORY_FALLBACK_HEAPS = '1' } }
     # descriptor reads as data by plain loads instead of getDimensions on a picked handle
     'no-getdims'   = @{ More = @{ VICTORY_NO_GETDIMS = '1' } }
+    # mesh draws on and the device-removed data (D3D12's auto breadcrumbs, which the launcher turns on to light by default and
+    # which put a marker write after every command of every list) off
+    'dred-off'     = @{ Dred = 'off' }
+    # the same with the full device-removed data (a text for every command: the report names the copy or draw that
+    # does not finish; slower)
+    'base-dred'    = @{ Dred = 'full' }
+    # the title's own counts of vertices and primitives in the mesh programs instead of the declared maxima
+    # (VICTORY_MESH_COUNTS=exact: docs\intel-arc.md), mesh draws on
+    'exact'        = @{ More = @{ VICTORY_MESH_COUNTS = 'exact' } }
+    'exact-dred'   = @{ Dred = 'full'; More = @{ VICTORY_MESH_COUNTS = 'exact' } }
+    # the one mesh program (MS_VS_Transform_4dbafe93, with its pixel shader 3711fdad456538a1) whose ExecuteIndirect was
+    # the first command not finished in two runs (command 107 of a list of 160, 14 s after its pipeline's first bind):
+    # its draws alone, and every draw but its own
+    'only-ea2e'    = @{ MeshTest = 'only:ea2eadde55090b27' }
+    'skip-ea2e'    = @{ SkipPipelines = 'ea2eadde55090b27' }
+    # indirect mesh executions (most of the title's mesh draws), each issued with a count of 0 (the clamp and all state
+    # as before: nothing runs), and with a barrier on all work after each / every 8th one
+    'ind-zero'     = @{ More = @{ VICTORY_MESH_INDIRECT = 'zero' } }
+    'ind-fence'    = @{ More = @{ VICTORY_MESH_INDIRECT = 'fence:1' } }
+    'ind-fence8'   = @{ More = @{ VICTORY_MESH_INDIRECT = 'fence:8' } }
+    # every mesh draw, direct and indirect, issued empty (zero groups, a count of 0): all the state of a draw and no work
+    'all-zero'     = @{ More = @{ VICTORY_MESH_ZERO = '1'; VICTORY_MESH_INDIRECT = 'zero' } }
     # the three above together (if this one hangs too, none of them is the cause alone)
     'all-three'    = @{ More = @{ VICTORY_CARD_BUFFERS = '0'; VICTORY_FALLBACK_HEAPS = '1'; VICTORY_NO_GETDIMS = '1' } }
     # memory against CPU time, with the host's default (no mesh draws: the settings that stay stable); compare
@@ -122,8 +150,16 @@ if ($Only) {
     $Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })   # (-File passes a comma list as one string)
     $unknown = @($Only | Where-Object { $_ -notin $names })
     if ($unknown) { Write-Host "Unknown: $($unknown -join ', '). Known: $($names -join ', ')"; exit 1 }
-    $names = @($names | Where-Object { $_ -in $Only })
+    $names = @($Only)   # in the order given, repeats too (-Only base-dred,exact,exact)
 }
+# Each setting $Repeat times, in the order given.
+$seen = @{}
+$plan = @(foreach ($name in $names) {
+    foreach ($k in 1..$Repeat) {
+        $seen[$name] = 1 + [int]$seen[$name]
+        [pscustomobject]@{ Name = $name; Label = $(if ($seen[$name] -gt 1 -or $Repeat -gt 1) { "$name#$($seen[$name])" } else { $name }) }
+    }
+})
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $logs = Join-Path $repo 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -207,18 +243,36 @@ function Test-InWorld([string]$path) {
     }
     return $false
 }
+$holder = $null
+if ($Hold) {
+    $waited = 0
+    while (Get-Process -Name victory -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*victory-fuzz*hold*' }) {
+        if ($waited -ge 900) { Write-Host 'A victory.exe is still running after 15 minutes: stopping.'; exit 1 }
+        if ($waited -eq 0) { Write-Host 'A victory.exe is running; waiting for it to end.' }
+        Start-Sleep -Seconds 2
+        $waited += 2
+    }
+    $holdDir = Join-Path $env:TEMP 'victory-fuzz\hold'
+    New-Item -ItemType Directory -Force -Path $holdDir | Out-Null
+    Copy-Item -Force (Join-Path $env:SystemRoot 'System32\ping.exe') (Join-Path $holdDir 'victory.exe')
+    $holder = Start-Process -FilePath (Join-Path $holdDir 'victory.exe') -ArgumentList @('-n', '3600', '127.0.0.1') -WindowStyle Hidden -PassThru
+    Write-Host "Holding the card (placeholder process $($holder.Id), at most an hour)."
+}
+$foreign = { Get-Process -Name victory -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*victory-fuzz*hold*' } | Where-Object { -not $holder -or $_.Id -ne $holder.Id } }
 
 $rows = @()
 $n = 0
-foreach ($name in $names) {
+try {
+foreach ($item in $plan) {
     $n++
+    $name = $item.Name
     if (Get-OurGame) {
         Write-Host 'A victory.exe of this repository is still running; close it first.'
         break
     }
-    $others = @(Get-Process -Name victory -ErrorAction SilentlyContinue)
+    $others = @(& $foreign)
     if ($others) { Write-Host ("  (note: {0} other victory.exe running, not ours: PID {1}; it may change the timings)" -f $others.Count, (($others | ForEach-Object { $_.Id }) -join ', ')) }
-    Write-Host ("[{0}/{1}] {2}: up to {3} s" -f $n, $names.Count, $name, $Seconds)
+    Write-Host ("[{0}/{1}] {2}: up to {3} s" -f $n, $plan.Count, $item.Label, $Seconds)
     # Mesh draws on, unless the setting says otherwise: the host skips them on an Intel GPU by default.
     $splat = @{ Exe = $Exe; Build = $Build; MeshTest = 'off' }
     if ($PSBoundParameters.ContainsKey('MinFreeGB')) { $splat['MinFreeGB'] = $MinFreeGB }
@@ -264,7 +318,7 @@ foreach ($name in $names) {
         Where-Object { $_.LastWriteTime -ge $started.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $log) {
         Write-Host '  No log: the launcher did not start the game (probably the free-RAM floor). Stopping.'
-        $rows += [pscustomobject]@{ Setting = $name; Result = 'not started'; Seconds = ''; LastFrame = ''; Log = '' }
+        $rows += [pscustomobject]@{ Setting = $item.Label; Result = 'not started'; Seconds = ''; LastFrame = ''; Log = '' }
         break
     }
     $o = Get-Outcome $log.FullName
@@ -272,15 +326,18 @@ foreach ($name in $names) {
     $secs = if ($closed) { [int]((Get-Date) - $started).TotalSeconds } else { $o.Seconds }
     Write-Host ("  {0}, {1} s, last frame {2}" -f $result, $secs, $o.LastFrame)
     $st = Get-RunStats $log.FullName
-    $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; MedianMs = $st.MedianMs; Waiting = $st.Waiting; Unmapped = $st.Unmapped; LateS = $st.LateS; MinFreeGB = $st.MinFreeGB; PeakGB = $st.PeakGB; Log = $log.Name }
-    if ($n -lt $names.Count) { Start-Sleep -Seconds $PauseSeconds }
+    $rows += [pscustomobject]@{ Setting = $item.Label; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; MedianMs = $st.MedianMs; Waiting = $st.Waiting; Unmapped = $st.Unmapped; LateS = $st.LateS; MinFreeGB = $st.MinFreeGB; PeakGB = $st.PeakGB; Log = $log.Name }
+    if ($n -lt $plan.Count) { Start-Sleep -Seconds $PauseSeconds }
+}
+} finally {
+    if ($holder -and -not $holder.HasExited) { $holder.Kill() }
 }
 
 Write-Host ''
 $table = $rows | Format-Table -AutoSize | Out-String
 Write-Host $table
 $survivors = @($rows | Where-Object { $_.Result -eq 'survived' })
-$base = $rows | Where-Object { $_.Setting -eq 'base' }
+$base = $rows | Where-Object { $_.Setting -eq 'base' -or $_.Setting -like 'base#*' }
 if ($survivors.Count -eq 0) {
     Write-Host 'No setting survived. The hang does not depend on any of them; the logs name the command it stops at.'
 } elseif ($base -and $base.Result -eq 'survived') {

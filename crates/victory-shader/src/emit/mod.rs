@@ -184,6 +184,16 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a mesh program declares the counts its own allocation request sends instead of its maxima
+/// (`VICTORY_MESH_COUNTS=exact`), where the program has the shape that allows it (one request, from lane 0,
+/// whose counts a few scalar instructions make over values every lane holds): the host then draws only the
+/// vertices and primitives the program exports, and the primitives past the count do not exist. Off by
+/// default. Part of the translation: the shader cache keys on it.
+pub fn mesh_counts_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_COUNTS").is_ok_and(|v| v.trim() == "exact"))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
