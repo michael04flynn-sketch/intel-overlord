@@ -16,6 +16,9 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // helper scripts that read the run's own logs and dumps (`scripts/mesh-census.py`): source text like
+    // the shell and PowerShell ones, still under the size and encoded-run limits above
+    "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
