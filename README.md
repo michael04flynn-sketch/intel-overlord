@@ -1,9 +1,58 @@
-# VIctory on an RX 7900 XTX
+# intel-overlord: VIctory on Intel Arc
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A fork of [VIctory](https://github.com/Marvisak/VIctory) (through its AMD-tuned fork
+VIctory-Belobug-AMD), a compatibility layer that runs an Xbox Series title natively on
+Windows from files the user supplies, tuned here for **Intel Arc iGPU laptops that share
+the PC's memory**. GPL-3.0, like its parents. **This repository contains no game files,
+code or assets.** You need your own copy of the game; it is not affiliated with or endorsed
+by the game's developer or publisher.
 
-## The goal
+## Where it stands on Intel Arc (2026-11-27)
+
+Tested on one machine: Windows 11, Core Ultra X9 388H, 31 GB of RAM, Arc B390 (driver
+32.0.101.8724). Nothing here was measured on any other Intel part.
+
+| | |
+|---|---|
+| Stays up | **yes, with mesh draws skipped (the default on Intel)**: 300 s in the world with no GPU hang, three memory profiles 220 s each |
+| Speed in the world | about 125 to 136 ms a frame at the median (7 to 8 fps), 17 GB private, 1 to 2 GB of RAM left free at the end |
+| Textures | stream within a budget taken from the PC's free RAM (the card's memory is the PC's memory); no hard cap, no waits on remaps |
+| Shaders | the offline survey translates all 26,084 programs of the title; the driver built the pipelines the runs asked for, except 28 compute programs that need waves of 64, which this GPU (waves of 16 to 32) refuses |
+| **Missing: the world's meshes** | the title's mesh draws stop this GPU (26 of 27 runs that issued them hung it, 56 to 147 s in, whichever shaders were drawn); the host skips them, so geometry drawn that way is not on screen. The cause is not found |
+| **Missing: some lighting and effects** | the 28 refused compute programs are GPU particles, decal trails, triangle-clip effects, volumetric water transmission, hair shadows and the `alphaResolve` mip prefilter; they are dropped every frame |
+
+So: stable, but not a complete picture. Getting the meshes back is the open problem
+(`docs/intel-arc.md` has 40 runs of experiments, what was ruled out, and the next steps);
+making the 28 compute programs run in waves of 32 is translator work still to do.
+
+### Run it
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+.\scripts\play-intel-lowmem.ps1 -Exe 'C:\path\to\game_scarlett_master.exe'
+```
+
+The launcher prints its settings, writes a log and a memory timeline to `logs\`, and
+refuses to start under a free-RAM floor (`-MinFreeGB`). Profiles (`-Profile`, world
+frames, 220 s each, one run each, so read the numbers loosely):
+
+| Profile | Card buffers | Median frame | RAM left at the end |
+|---|---|---|---|
+| Lean | 128 MB | 545 ms | 1.8 GB |
+| **Balanced** (default) | 512 MB | 136 ms | 2.1 GB |
+| Fast | 1024 MB | 125 ms | 1.0 GB |
+
+`-MeshTest off` draws the meshes anyway (the game then hangs the GPU within a minute or two).
+`scripts\intel-sweep.ps1` runs the experiments one after another unattended and says which
+settings survive; `scripts\intel-mesh-bisect.ps1` halves the mesh shaders by hash.
+
+---
+
+## Upstream notes: VIctory on an RX 7900 XTX
+
+The rest of this file is the AMD fork's own README, kept as it was.
+
+### The goal
 
 **A stable 30 fps or more without ray tracing, then as high a frame rate and as
 low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
