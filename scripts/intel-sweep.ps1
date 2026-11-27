@@ -15,6 +15,11 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [int]$Seconds = 180,
+    # With a value: each run ends that many seconds after the world's first frame (a frame of 100 ms
+    # and more). The title's wait on the front end varies a lot between runs (85 s to over 200 s), so
+    # with a fixed -Seconds one run had 140 s of world and the next 20 s; this gives every run the same
+    # stretch. -Seconds is then only the longest a run may take (use 400 and more).
+    [int]$WorldSeconds = 0,
     [int]$PauseSeconds = 20,
     # Passed to the launcher as -MinFreeGB when given (its default is 23).
     [double]$MinFreeGB,
@@ -175,6 +180,25 @@ function Get-RunStats([string]$path) {
     [pscustomobject]$r
 }
 
+# Whether the log written so far has a frame of 100 ms or more (the world: the front end's are 33 ms).
+function Test-InWorld([string]$path) {
+    try {
+        $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $len = $fs.Length
+            $take = [int][math]::Min($len, 400000)
+            [void]$fs.Seek($len - $take, 'Begin')
+            $buf = New-Object byte[] $take
+            $got = $fs.Read($buf, 0, $take)
+            $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got)
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+    foreach ($m in [regex]::Matches($text, '([0-9.]+) fps, ([0-9.]+) ms/frame')) {
+        if ([double]::Parse($m.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture) -ge 100) { return $true }
+    }
+    return $false
+}
+
 $rows = @()
 $n = 0
 foreach ($name in $names) {
@@ -193,7 +217,23 @@ foreach ($name in $names) {
     foreach ($k in $experiments[$name].Keys) { $splat[$k] = $experiments[$name][$k] }
     $started = Get-Date
     $job = Start-Job -ScriptBlock { param($launcher, $splat) & $launcher @splat } -ArgumentList $Launcher, $splat
-    $finished = Wait-Job $job -Timeout $Seconds
+    $cap = $started.AddSeconds($Seconds)
+    $limit = $cap
+    $worldAt = $null
+    while ($true) {
+        $finished = Wait-Job $job -Timeout 5
+        if ($finished -or (Get-Date) -ge $limit) { break }
+        if ($WorldSeconds -gt 0 -and -not $worldAt) {
+            $cur = Get-ChildItem $logs -Filter 'victory-*.log' -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $started.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($cur -and (Test-InWorld $cur.FullName)) {
+                $worldAt = Get-Date
+                $due = $worldAt.AddSeconds($WorldSeconds)
+                if ($due -lt $cap) { $limit = $due }
+                Write-Host ("  the world began {0:N0} s in; ends the run {1} s later" -f ($worldAt - $started).TotalSeconds, $WorldSeconds)
+            }
+        }
+    }
     $closed = $false
     if (-not $finished) {
         $closed = $true
@@ -211,7 +251,7 @@ foreach ($name in $names) {
     }
     $o = Get-Outcome $log.FullName
     $result = if ($closed -and -not $o.World) { 'no world' } elseif ($closed) { 'survived' } else { $o.How }
-    $secs = if ($closed) { $Seconds } else { $o.Seconds }
+    $secs = if ($closed) { [int]((Get-Date) - $started).TotalSeconds } else { $o.Seconds }
     Write-Host ("  {0}, {1} s, last frame {2}" -f $result, $secs, $o.LastFrame)
     $st = Get-RunStats $log.FullName
     $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; MedianMs = $st.MedianMs; Waiting = $st.Waiting; Unmapped = $st.Unmapped; LateS = $st.LateS; MinFreeGB = $st.MinFreeGB; PeakGB = $st.PeakGB; Log = $log.Name }
