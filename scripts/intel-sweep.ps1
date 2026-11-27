@@ -18,6 +18,8 @@ param(
     [string[]]$Only,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$Launcher,
+    # Every run also saves frames as PNG files (logs\frames-<time>\; the launcher's -Capture).
+    [switch]$Capture,
     [switch]$List
 )
 
@@ -71,6 +73,14 @@ $experiments = [ordered]@{
     # the same without keeping the card's clocks up (a compute queue spinning between submissions: on an
     # iGPU that shares the CPU's power budget it may cost more than it gives)
     'nv-noawake'   = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_SHOW_AFTER = '1'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1' } }
+    # Textures (the host caps a streamed texture's side at 1024, 512 from 92 % of the card's budget, 256
+    # from 97 %: on this GPU the budget is what is in use plus the free RAM less the reserve, so in the
+    # world it stands at 100 % and every texture made then is 256 pixels at most) and what limits how many
+    # are made (the card's room is the PC's free RAM)
+    'tex-512'      = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_MAX = '512' } }
+    'tex-1024'     = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_MAX = '1024' } }
+    'inplace'      = @{ MeshTest = ''; InPlace = $true }
+    'reserve-2g'   = @{ MeshTest = ''; More = @{ VICTORY_UMA_RESERVE_MB = '2048' } }
     # the indirect light stand-in the NVIDIA launcher turns on (80 %)
     'ambient'      = @{ MeshTest = ''; More = @{ VICTORY_AMBIENT = '0.8' } }
     'lean'         = @{ Profile = 'Lean'; MeshTest = '' }
@@ -123,18 +133,29 @@ function Get-Outcome([string]$path) {
     [pscustomobject]@{ How = $how; LastFrame = $last; Seconds = $secs; World = ($slowest -ge 100) }
 }
 
+# The game of this repository (target\<build>\victory.exe): only that is waited for and closed. Another
+# victory.exe, e.g. a test binary somebody else is running from a copy elsewhere, is left alone (it can
+# still change the timings: run when it is gone if the numbers matter).
+function Get-OurGame {
+    Get-Process -Name victory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith((Join-Path $repo 'target'), [StringComparison]::OrdinalIgnoreCase) }
+}
+
 $rows = @()
 $n = 0
 foreach ($name in $names) {
     $n++
-    if (Get-Process -Name victory -ErrorAction SilentlyContinue) {
-        Write-Host 'A victory.exe is still running; close it first.'
+    if (Get-OurGame) {
+        Write-Host 'A victory.exe of this repository is still running; close it first.'
         break
     }
+    $others = @(Get-Process -Name victory -ErrorAction SilentlyContinue)
+    if ($others) { Write-Host ("  (note: {0} other victory.exe running, not ours: PID {1}; it may change the timings)" -f $others.Count, (($others | ForEach-Object { $_.Id }) -join ', ')) }
     Write-Host ("[{0}/{1}] {2}: up to {3} s" -f $n, $names.Count, $name, $Seconds)
     # Mesh draws on, unless the setting says otherwise: the host skips them on an Intel GPU by default.
     $splat = @{ Exe = $Exe; Build = $Build; MeshTest = 'off' }
     if ($PSBoundParameters.ContainsKey('MinFreeGB')) { $splat['MinFreeGB'] = $MinFreeGB }
+    if ($Capture) { $splat['Capture'] = $true }
     foreach ($k in $experiments[$name].Keys) { $splat[$k] = $experiments[$name][$k] }
     $started = Get-Date
     $job = Start-Job -ScriptBlock { param($launcher, $splat) & $launcher @splat } -ArgumentList $Launcher, $splat
@@ -142,7 +163,7 @@ foreach ($name in $names) {
     $closed = $false
     if (-not $finished) {
         $closed = $true
-        Get-Process -Name victory -ErrorAction SilentlyContinue | Stop-Process -Force
+        Get-OurGame | Stop-Process -Force
         [void](Wait-Job $job -Timeout 90)
     }
     $null = Receive-Job $job -ErrorAction SilentlyContinue

@@ -18,7 +18,7 @@ Tested on one machine: Windows 11, Core Ultra X9 388H, 31 GB of RAM, Arc B390 (d
 | Speed in the world | about 125 to 136 ms a frame at the median (7 to 8 fps), 17 GB private, 1 to 2 GB of RAM left free at the end |
 | Textures | stream within a budget taken from the PC's free RAM (the card's memory is the PC's memory); no hard cap, no waits on remaps |
 | Shaders | the offline survey translates all 26,084 programs of the title; the driver built the pipelines the runs asked for, except 28 compute programs that need waves of 64, which this GPU (waves of 16 to 32) refuses |
-| **Missing: the world's meshes** | the title's mesh draws stop this GPU (26 of 27 runs that issued them hung it, 56 to 147 s in, whichever shaders were drawn); the host skips them, so geometry drawn that way is not on screen. The cause is not found |
+| **Missing: the world's meshes** | the title's mesh draws stop this GPU (26 of 27 runs that issued them hung it, 56 to 147 s in, whichever shaders were drawn); the host skips them, so geometry drawn that way is not on screen: in one captured world frame 898 mesh draws were dropped against 34 vertex draws. The cause is not found. The textures that are drawn (loading art, title cards) are sharp; the scene itself has little left to texture |
 | **Missing: some lighting and effects** | the 28 refused compute programs are GPU particles, decal trails, triangle-clip effects, volumetric water transmission, hair shadows and the `alphaResolve` mip prefilter; they are dropped every frame |
 
 So: stable, but not a complete picture. Getting the meshes back is the open problem
@@ -42,6 +42,8 @@ frames, 220 s each, one run each, so read the numbers loosely):
 | **Balanced** (default) | 512 MB | 136 ms | 2.1 GB |
 | Fast | 1024 MB | 125 ms | 1.0 GB |
 
+`-Capture` saves the presented frames as PNG files in `logs\frames-<time>\`, to see what is on screen.
+If the title stays on "ACCOUNT PICKER / PLAYER", press Enter (the keyboard is the stand-in pad).
 `-MeshTest off` draws the meshes anyway (the game then hangs the GPU within a minute or two).
 `scripts\intel-sweep.ps1` runs the experiments one after another unattended and says which
 settings survive; `scripts\intel-mesh-bisect.ps1` halves the mesh shaders by hash.

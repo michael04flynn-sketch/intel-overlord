@@ -29,8 +29,16 @@ $trail = @()
 $hasMin = $PSBoundParameters.ContainsKey('MinFreeGB')
 
 # One run with this keep filter: 'hung', 'survived' or something else, and the log it wrote.
+# Only the game of this repository (target\...\victory.exe) is waited for and closed; another victory.exe
+# (a test binary run from a copy elsewhere) is left alone.
+function Get-OurGame {
+    $target = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'target'
+    Get-Process -Name victory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($target, [StringComparison]::OrdinalIgnoreCase) }
+}
+
 function Invoke-Keep([string]$filter) {
-    if (Get-Process -Name victory -ErrorAction SilentlyContinue) { throw 'A victory.exe is still running; close it first.' }
+    if (Get-OurGame) { throw 'A victory.exe of this repository is still running; close it first.' }
     $splat = @{ Exe = $Exe; Build = $Build; MeshTest = "keep:$filter" }
     foreach ($k in $Extra.Keys) { $splat[$k] = $Extra[$k] }
     if ($script:hasMin) { $splat['MinFreeGB'] = $script:MinFreeGB }
@@ -40,7 +48,7 @@ function Invoke-Keep([string]$filter) {
     $closed = $false
     if (-not $finished) {
         $closed = $true
-        Get-Process -Name victory -ErrorAction SilentlyContinue | Stop-Process -Force
+        Get-OurGame | Stop-Process -Force
         [void](Wait-Job $job -Timeout 90)
     }
     $null = Receive-Job $job -ErrorAction SilentlyContinue

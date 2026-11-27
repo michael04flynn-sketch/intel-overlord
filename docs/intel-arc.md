@@ -428,6 +428,75 @@ Lean is the slow one: with fewer title buffers on the card the CPU compares and 
 Fast is a little quicker than Balanced and leaves the PC 1 GB, which a browser can take: Balanced stays
 the default.
 
+## What was taken from VIctory-NVIDIA (2026-11-27)
+
+[VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) is another fork of the same
+host with a few months of its own fixes (GPL-3.0, like this one; the commits keep their original
+authors). Its history was read commit by commit; what was taken, each with the tests that came with it:
+
+| Commit here | What it does | What its author found (on their GPUs) |
+|---|---|---|
+| `cb109a3` (from fxceless/victory-fork#1324) | a dynamic descriptor slot goes back only to the host heap that handed it out (every heap has an id) | when a title frees a heap before the lists using it are reset and a new heap lands at the same address, resetting the old list freed the new heap's slots; two live lists then overwrote each other's descriptors (seen on NVIDIA) |
+| `85efdc9` | the buffer comparisons are submitted as their own list after the state decay | title buffers that were promoted implicitly can decay to COMMON first: fixes D3D12 error 538 |
+| `c2a8e69` (from fxceless/victory-fork#1266) | raw (byte-address) views stay inside their buffer: a range past the end is shortened, sub-dword and unaligned ones are fixed (`VICTORY_RAW_VIEW_CLAMP=0` restores the old behaviour) | the run's log now counts the cuts (`raw view clamp ...`): **0 in the world on this machine so far**, so on this GPU it is a guard, not a cure |
+| `0ead72a` | a pipeline with static samplers is not loaded from the pipeline library (`VICTORY_LIBRARY_STATIC_SAMPLERS=1` restores) | a stored pipeline keeps the sampler-table places of the run that stored it; loaded in a run that made its samplers in another order it samples through other ones. On their 4070 SUPER that gave posterized light (the composite pass reading its colour-grading tables unfiltered). **Lighting, so worth having here too; not yet looked for on this GPU's screen** |
+
+None of these cured the mesh hang (a run with mesh draws on hung at 74 s, as before). They are
+in because they are correct and cost nothing measurable; they are not claimed as the fix.
+
+Not taken, deliberately:
+
+- **Downloading runtime DLLs** and the DLSS / frame-generation paths: NVIDIA-only, and a binary
+  fetched at run time is not something to add to a repository that ships no binaries.
+- **The wave-32 lowering** (`4f49709`, `89cfae2`, `eeb17cc`, `854f57f`, `3bcc96f` there): it is
+  what would let the 28 wave-64 compute programs run on this GPU, but it conflicts deeply with the
+  translator here, and their widened water programs left dark tiles on their own screenshots.
+  Porting it blind would trade missing effects for wrong ones. Still to do, with a check against
+  the offline survey (`victory.exe translate --validate`) after each step.
+- Their launcher's settings are not copied wholesale: `scripts\intel-sweep.ps1` has them as
+  experiments (`nv-all`, `nv-noawake`, `ambient`) so they are measured here before any is a default.
+
+## What the screen shows, from the captured frames (2026-11-27 15:35, Balanced, mesh draws skipped)
+
+`play-intel-lowmem.ps1 -Capture` (or `intel-sweep.ps1 -Capture`) saves the frames the host presents as
+PNG files in `logs\frames-<time>\` (half size: a frame at every step the log reports, and the world's 2nd,
+6th, 30th, 80th and later ones; diag build). One run, 230 s, 3,190 frames, about 630 of them in the world
+(it began at frame 2,556, the first of 500 draws or more):
+
+- **Textures that are drawn are there and sharp.** The loading-screen art (the flamingo cards, the
+  key art with the house and the car) comes out in full detail at 960x540 (half of 1920x1080), the title
+  cards' lettering is clean, nothing is pink, black or stretched.
+- **The 3D scene is the part that is missing, not its textures.** The world starts with the title's
+  night-time opening scene: the distant lights and the hair strands are drawn, but no head or body can
+  be seen around the hair and the ground is dark noise (the frames are dark, so read this loosely).
+  The op list of one world frame (`frame-2796-ops.txt`, 4,629 lines) has
+  **898 mesh draws dropped (`VICTORY_MESH_TEST=skip`) against 34 ordinary vertex draws**, and 210 stages
+  of the ray-tracing structure builder dropped (RT is off). So about nine draws in ten of a world frame
+  are mesh draws, and with them off there are few surfaces left to put a texture on. Until the mesh
+  hang is solved, "all textures show" cannot be checked on the scene itself.
+- **Textures wait for memory in the world.** In that run: the card at 100 % of the budget the host
+  allows itself (10,136 MB of 10,136 MB), 32,268 texture slots uploaded (1,376 MB), 18,822 waiting for
+  room, 16,006 passed over because the title had unmapped their memory, and the 3,108 that had to wait
+  for memory were shown 42 s late on average. The room is the PC's RAM: free RAM was 20 GB before the run
+  and fell as low as 0.2 GB (the process peaked at 21.5 GB in memory). About 8 GB of the PC was the
+  desktop's (Edge 2 GB, the Claude app 2 GB, Defender, Windows; measured in another moment). Closing
+  programs before the run is the one thing that gives textures more room.
+- **A limit worth knowing about.** With `VICTORY_TEXTURE_MAX` unset the host caps a streamed texture's
+  longer side at 1024, at 512 from 92 % of the card's budget and at 256 from 97 %. Here the budget is what
+  the process uses plus the free RAM less the 3 GB reserve, so once free RAM is under about 3.4 GB it is at
+  100 % and every texture *made then* is 256 pixels at most (the ones made earlier keep 1024). The sweep
+  has `tex-512` and `tex-1024` to set it outright; the default is unchanged, because with no meshes on
+  screen there is no scene to judge the sharpness on, and more pixels is more RAM that is not there.
+- **One run in eight never leaves the front end**: the title sits on "ACCOUNT PICKER (Y) / PLAYER (A)" and
+  waits for a button. The keyboard is the stand-in pad: **Enter is A**, Esc is Menu, Tab is View, X and Y
+  are X and Y, the arrows are the D-pad (`gameinput.rs`). Press Enter on that screen; the sweep reports
+  such a run as `no world`.
+
+Newer Intel drivers: the release notes of 32.0.101.8991 (2026-08-25) list no mesh-shader, DX12 hang or
+device-removal fix for Core Ultra Series 3 (their known issues name three games only); those of
+32.0.101.8974 could not be fetched (HTTP 403). So a driver newer than 8724 is not known to cure the hang,
+and no run here used one.
+
 ## Not known yet
 
 - What the title's run has that the standalone test has not, and the hang needs: several queues at
