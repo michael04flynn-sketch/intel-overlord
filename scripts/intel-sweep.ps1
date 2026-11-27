@@ -5,6 +5,9 @@
 # "survived" when the game had got into the world (frames of 100 ms and more), else "no world":
 # that run says nothing, run it again. A run that ends sooner is reported with how it ended. Every run writes its own log
 # and memory timeline in logs\ (play-intel-lowmem.ps1 does that); the table is saved there too.
+# Table columns from the run's last statistics: MedianMs (world frames), Waiting (texture slots waiting for room),
+# Unmapped (passed over: the title had unmapped their memory), LateS (mean seconds a texture waited for memory),
+# MinFreeGB / PeakGB (the PC's lowest free RAM and the game's peak working set, from the .mem.csv).
 #   -Only base,skip-fsr4   run just those
 #   -List                  show the settings and stop
 # Close big programs first: the launcher refuses to start under its free-RAM floor, and the sweep
@@ -12,12 +15,19 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [int]$Seconds = 180,
+    # With a value: each run ends that many seconds after the world's first frame (a frame of 100 ms
+    # and more). The title's wait on the front end varies a lot between runs (85 s to over 200 s), so
+    # with a fixed -Seconds one run had 140 s of world and the next 20 s; this gives every run the same
+    # stretch. -Seconds is then only the longest a run may take (use 400 and more).
+    [int]$WorldSeconds = 0,
     [int]$PauseSeconds = 20,
     # Passed to the launcher as -MinFreeGB when given (its default is 23).
     [double]$MinFreeGB,
     [string[]]$Only,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [string]$Launcher,
+    # Every run also saves frames as PNG files (logs\frames-<time>\; the launcher's -Capture).
+    [switch]$Capture,
     [switch]$List
 )
 
@@ -65,6 +75,22 @@ $experiments = [ordered]@{
     'all-three'    = @{ More = @{ VICTORY_CARD_BUFFERS = '0'; VICTORY_FALLBACK_HEAPS = '1'; VICTORY_NO_GETDIMS = '1' } }
     # memory against CPU time, with the host's default (no mesh draws: the settings that stay stable); compare
     # the frame times in the logs (scripts do not average them: `ms/frame` lines of the world)
+    # the settings VIctory-NVIDIA's launcher plays with (scripts/play.ps1 there: relay 2, copy queue,
+    # card steps, indirect batch, thin lists, joined copies...), with the host default for meshes
+    'nv-all'       = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1' } }
+    # the same without keeping the card's clocks up (a compute queue spinning between submissions: on an
+    # iGPU that shares the CPU's power budget it may cost more than it gives)
+    'nv-noawake'   = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_SHOW_AFTER = '1'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1' } }
+    # Textures (the host caps a streamed texture's side at 1024, 512 from 92 % of the card's budget, 256
+    # from 97 %: on this GPU the budget is what is in use plus the free RAM less the reserve, so in the
+    # world it stands at 100 % and every texture made then is 256 pixels at most) and what limits how many
+    # are made (the card's room is the PC's free RAM)
+    'tex-512'      = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_MAX = '512' } }
+    'tex-1024'     = @{ MeshTest = ''; More = @{ VICTORY_TEXTURE_MAX = '1024' } }
+    'inplace'      = @{ MeshTest = ''; InPlace = $true }
+    'reserve-2g'   = @{ MeshTest = ''; More = @{ VICTORY_UMA_RESERVE_MB = '2048' } }
+    # the indirect light stand-in the NVIDIA launcher turns on (80 %)
+    'ambient'      = @{ MeshTest = ''; More = @{ VICTORY_AMBIENT = '0.8' } }
     'lean'         = @{ Profile = 'Lean'; MeshTest = '' }
     'fast'         = @{ Profile = 'Fast'; MeshTest = '' }
     # the card's budget as the system gives it
@@ -115,26 +141,103 @@ function Get-Outcome([string]$path) {
     [pscustomobject]@{ How = $how; LastFrame = $last; Seconds = $secs; World = ($slowest -ge 100) }
 }
 
+# The game of this repository (target\<build>\victory.exe): only that is waited for and closed. Another
+# victory.exe, e.g. a test binary somebody else is running from a copy elsewhere, is left alone (it can
+# still change the timings: run when it is gone if the numbers matter).
+function Get-OurGame {
+    Get-Process -Name victory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith((Join-Path $repo 'target'), [StringComparison]::OrdinalIgnoreCase) }
+}
+
+# What a run's log says about textures and memory, from its last statistics (the sweep's table columns).
+function Get-RunStats([string]$path) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $text = [IO.File]::ReadAllText($path)
+    $last = { param($rx) $m = [regex]::Matches($text, $rx); if ($m.Count) { $m[$m.Count - 1] } else { $null } }
+    $r = [ordered]@{ Waiting = ''; Unmapped = ''; LateS = ''; MedianMs = ''; MinFreeGB = ''; PeakGB = '' }
+    $m = & $last 'textures picked by index: (\d+) uploaded so far \((\d+) MB\), (\d+) waiting, (\d+) passed over unmapped'
+    if ($m) { $r.Waiting = [int]$m.Groups[3].Value; $r.Unmapped = [int]$m.Groups[4].Value }
+    $m = & $last 'the same after waiting for memory: (\d+), mean (\d+) ms'
+    if ($m) { $r.LateS = [math]::Round([double]$m.Groups[2].Value / 1000, 0) }
+    # world frames only (the front end's are 33 ms): the median of the logged ms a frame
+    $ms = @([regex]::Matches($text, '([0-9.]+) fps, ([0-9.]+) ms/frame') |
+        ForEach-Object { [double]::Parse($_.Groups[2].Value, $inv) } | Where-Object { $_ -ge 100 } | Sort-Object)
+    if ($ms.Count) { $r.MedianMs = [math]::Round($ms[[int][math]::Floor(($ms.Count - 1) / 2)], 0) }
+    $csv = [IO.Path]::ChangeExtension($path, '.mem.csv')
+    if (Test-Path $csv) {
+        $free = @(); $ws = @()
+        foreach ($row in Import-Csv $csv) {
+            $w = 0.0
+            if ([double]::TryParse($row.victory_private_mb, [ref]$w) -and $w -ge 1000) {
+                $free += [double]$row.free_ram_mb; $ws += [double]$row.victory_ws_mb
+            }
+        }
+        if ($free.Count) {
+            $r.MinFreeGB = [math]::Round(($free | Measure-Object -Minimum).Minimum / 1024, 1)
+            $r.PeakGB = [math]::Round(($ws | Measure-Object -Maximum).Maximum / 1024, 1)
+        }
+    }
+    [pscustomobject]$r
+}
+
+# Whether the log written so far has a frame of 100 ms or more (the world: the front end's are 33 ms).
+function Test-InWorld([string]$path) {
+    try {
+        $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $len = $fs.Length
+            $take = [int][math]::Min($len, 400000)
+            [void]$fs.Seek($len - $take, 'Begin')
+            $buf = New-Object byte[] $take
+            $got = $fs.Read($buf, 0, $take)
+            $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got)
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+    foreach ($m in [regex]::Matches($text, '([0-9.]+) fps, ([0-9.]+) ms/frame')) {
+        if ([double]::Parse($m.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture) -ge 100) { return $true }
+    }
+    return $false
+}
+
 $rows = @()
 $n = 0
 foreach ($name in $names) {
     $n++
-    if (Get-Process -Name victory -ErrorAction SilentlyContinue) {
-        Write-Host 'A victory.exe is still running; close it first.'
+    if (Get-OurGame) {
+        Write-Host 'A victory.exe of this repository is still running; close it first.'
         break
     }
+    $others = @(Get-Process -Name victory -ErrorAction SilentlyContinue)
+    if ($others) { Write-Host ("  (note: {0} other victory.exe running, not ours: PID {1}; it may change the timings)" -f $others.Count, (($others | ForEach-Object { $_.Id }) -join ', ')) }
     Write-Host ("[{0}/{1}] {2}: up to {3} s" -f $n, $names.Count, $name, $Seconds)
     # Mesh draws on, unless the setting says otherwise: the host skips them on an Intel GPU by default.
     $splat = @{ Exe = $Exe; Build = $Build; MeshTest = 'off' }
     if ($PSBoundParameters.ContainsKey('MinFreeGB')) { $splat['MinFreeGB'] = $MinFreeGB }
+    if ($Capture) { $splat['Capture'] = $true }
     foreach ($k in $experiments[$name].Keys) { $splat[$k] = $experiments[$name][$k] }
     $started = Get-Date
     $job = Start-Job -ScriptBlock { param($launcher, $splat) & $launcher @splat } -ArgumentList $Launcher, $splat
-    $finished = Wait-Job $job -Timeout $Seconds
+    $cap = $started.AddSeconds($Seconds)
+    $limit = $cap
+    $worldAt = $null
+    while ($true) {
+        $finished = Wait-Job $job -Timeout 5
+        if ($finished -or (Get-Date) -ge $limit) { break }
+        if ($WorldSeconds -gt 0 -and -not $worldAt) {
+            $cur = Get-ChildItem $logs -Filter 'victory-*.log' -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $started.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($cur -and (Test-InWorld $cur.FullName)) {
+                $worldAt = Get-Date
+                $due = $worldAt.AddSeconds($WorldSeconds)
+                if ($due -lt $cap) { $limit = $due }
+                Write-Host ("  the world began {0:N0} s in; ends the run {1} s later" -f ($worldAt - $started).TotalSeconds, $WorldSeconds)
+            }
+        }
+    }
     $closed = $false
     if (-not $finished) {
         $closed = $true
-        Get-Process -Name victory -ErrorAction SilentlyContinue | Stop-Process -Force
+        Get-OurGame | Stop-Process -Force
         [void](Wait-Job $job -Timeout 90)
     }
     $null = Receive-Job $job -ErrorAction SilentlyContinue
@@ -148,9 +251,10 @@ foreach ($name in $names) {
     }
     $o = Get-Outcome $log.FullName
     $result = if ($closed -and -not $o.World) { 'no world' } elseif ($closed) { 'survived' } else { $o.How }
-    $secs = if ($closed) { $Seconds } else { $o.Seconds }
+    $secs = if ($closed) { [int]((Get-Date) - $started).TotalSeconds } else { $o.Seconds }
     Write-Host ("  {0}, {1} s, last frame {2}" -f $result, $secs, $o.LastFrame)
-    $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; Log = $log.Name }
+    $st = Get-RunStats $log.FullName
+    $rows += [pscustomobject]@{ Setting = $name; Result = $result; Seconds = $secs; LastFrame = $o.LastFrame; MedianMs = $st.MedianMs; Waiting = $st.Waiting; Unmapped = $st.Unmapped; LateS = $st.LateS; MinFreeGB = $st.MinFreeGB; PeakGB = $st.PeakGB; Log = $log.Name }
     if ($n -lt $names.Count) { Start-Sleep -Seconds $PauseSeconds }
 }
 

@@ -104,7 +104,12 @@ param(
     [string]$MeshTest,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
-    [switch]$NoLog
+    [switch]$NoLog,
+    # Saves frames of the run as PNG files (half size) in logs\frames-<time>\: every power-of-two frame
+    # and, once the world starts (a frame of 500 draws), its 2nd, 6th, 30th, 80th and some later ones
+    # (VICTORY_CAPTURE, VICTORY_CAPTURE_WORLD; diag build). To see with your own eyes what is textured and
+    # what is not, without sitting at the screen for the 2 minutes of the world.
+    [switch]$Capture
 )
 
 $profiles = @{
@@ -166,6 +171,15 @@ if ($MeshTest) {
     # (The host's own default on an Intel adapter, said here because the picture shows it: the world's
     # meshes are missing. 26 of 27 runs that drew them stopped the card; 3 of 3 that did not, ran on.)
     Write-Host 'Mesh draws are skipped on this Intel GPU (they stop it within a minute or two of the world: docs\intel-arc.md). -MeshTest off draws them anyway.'
+}
+if ($Capture) {
+    $frames = Join-Path (Join-Path $PSScriptRoot '..') ("logs\frames-{0:yyyyMMdd-HHmmss}" -f (Get-Date))
+    New-Item -ItemType Directory -Force -Path $frames | Out-Null
+    $lowMemory['VICTORY_CAPTURE'] = (Resolve-Path $frames).Path
+    $lowMemory['VICTORY_CAPTURE_WORLD'] = '1'
+    # frames counted from the world's first (3 fps there: 60 is 20 s in, 400 about 2 minutes)
+    $lowMemory['VICTORY_CAPTURE_WORLD_ALSO'] = '60,120,180,240,300,400,500'
+    Write-Host "Capturing frames to $($lowMemory['VICTORY_CAPTURE'])"
 }
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -eq 'full') { $lowMemory['VICTORY_D3D12_DRED'] = '1' } elseif ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
@@ -278,7 +292,7 @@ $sampler = $null
 if ($logPath) {
     $memPath = [IO.Path]::ChangeExtension($logPath, '.mem.csv')
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'memlog.ps1')`"", '-Out', "`"$memPath`"")   # quoted: a path may hold spaces
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'memlog.ps1')`"", '-Out', "`"$memPath`"", '-Under', "`"$([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target')))`"")   # quoted: a path may hold spaces; -Under: not another victory.exe on the PC
     Write-Host "Memory timeline: $memPath"
 }
 

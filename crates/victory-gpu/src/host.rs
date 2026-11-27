@@ -5980,11 +5980,10 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            #[cfg(feature = "diagnostics")]
-            marks.push((lists.len(), crate::copystat::Timed::Compare));
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST. Buffers
+        // decay to COMMON between ExecuteCommandLists calls, so submit
+        // the compare separately before signalling this submission's fence.
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6027,6 +6026,9 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6079,12 +6081,15 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6104,8 +6109,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
-            // With timing on each group is one of `runs` (and the compare
-            // of copies in the card's memory, with the last): every
+            // With timing on each group is one of `runs`: every
             // command's time on the card goes to the sums by pipeline.
             // The list's time from its sending to the card's signal, by what
             // it is, and of a run's the part its noted commands account for.
@@ -6136,7 +6140,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (_i, started);
+            let _ = (i, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -9583,6 +9587,13 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                // Raw buffer views cut to stay inside their buffer, since the start: past the end,
+                // shortened, under a dword, unaligned (`VICTORY_RAW_VIEW_CLAMP=0` leaves them as the
+                // title wrote them).
+                let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
+                tracing::info!(
+                    "raw view clamp (past end, shortened, sub-dword, unaligned) since the start: SRV {raw_srv:?}, UAV {raw_uav:?}"
+                );
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
