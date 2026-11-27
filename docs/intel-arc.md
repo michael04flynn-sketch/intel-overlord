@@ -478,9 +478,12 @@ PNG files in `logs\frames-<time>\` (half size: a frame at every step the log rep
   allows itself (10,136 MB of 10,136 MB), 32,268 texture slots uploaded (1,376 MB), 18,822 waiting for
   room, 16,006 passed over because the title had unmapped their memory, and the 3,108 that had to wait
   for memory were shown 42 s late on average. The room is the PC's RAM: free RAM was 20 GB before the run
-  and fell as low as 0.2 GB (the process peaked at 21.5 GB in memory). About 8 GB of the PC was the
-  desktop's (Edge 2 GB, the Claude app 2 GB, Defender, Windows; measured in another moment). Closing
-  programs before the run is the one thing that gives textures more room.
+  and fell as low as 0.2 GB (the process peaked at 21.5 GB in memory). **That run overlapped a stress
+  test another session was running on the same PC (some 6.7 GB and the same GPU), so the memory and
+  waiting figures here are worse than a run alone would show; the picture and the draw census are not
+  affected. Repeat it alone for clean figures.** About 8 GB of the PC was the desktop's (Edge 2 GB, the
+  Claude app 2 GB, Defender, Windows; measured in another moment). Closing programs before the run is
+  the one thing that gives textures more room.
 - **A limit worth knowing about.** With `VICTORY_TEXTURE_MAX` unset the host caps a streamed texture's
   longer side at 1024, at 512 from 92 % of the card's budget and at 256 from 97 %. Here the budget is what
   the process uses plus the free RAM less the 3 GB reserve, so once free RAM is under about 3.4 GB it is at
