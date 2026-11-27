@@ -9587,6 +9587,13 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                // Raw buffer views cut to stay inside their buffer, since the start: past the end,
+                // shortened, under a dword, unaligned (`VICTORY_RAW_VIEW_CLAMP=0` leaves them as the
+                // title wrote them).
+                let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
+                tracing::info!(
+                    "raw view clamp (past end, shortened, sub-dword, unaligned) since the start: SRV {raw_srv:?}, UAV {raw_uav:?}"
+                );
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
