@@ -21,7 +21,7 @@
 //!   draw's arguments; a UAV barrier follows each step.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -30,7 +30,8 @@ use windows::core::{Interface, s};
 
 use crate::host::host;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::Shader;
+use crate::pipeline::host::{GraphicsState, HostPipeline};
 
 /// Which mesh programs run as twins.
 enum Named {
@@ -39,49 +40,111 @@ enum Named {
     Some(Vec<String>),
 }
 
-fn named() -> &'static Named {
-    static NAMED: OnceLock<Named> = OnceLock::new();
-    NAMED.get_or_init(|| match std::env::var("VICTORY_MESH_TWIN") {
-        Ok(v) if v.trim() == "all" => {
-            tracing::warn!("VICTORY_MESH_TWIN=all: every mesh program runs as a compute twin (drawn: {})", draws());
-            Named::All
-        }
-        Ok(v) => {
+/// The programs `VICTORY_MESH_TWIN` names (`value`: its text, `None` if unset). Unset, on an Intel
+/// adapter every mesh program runs as a twin: the driver's mesh pipeline stops that card (26 of 27
+/// runs that issued mesh draws, `docs/intel-arc.md`), the twins do not (`0`, `off` or `none` turn
+/// them off there; elsewhere nothing runs as a twin unless named).
+fn named_from(value: Option<&str>, intel: bool) -> Named {
+    match value.map(str::trim) {
+        Some("all") => Named::All,
+        Some("0" | "off" | "none") => Named::Nothing,
+        Some(v) => {
             let hashes: Vec<String> = v
                 .split(',')
                 .map(|h| h.trim().to_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect();
-            if hashes.is_empty() {
-                Named::Nothing
-            } else {
-                tracing::warn!(?hashes, "VICTORY_MESH_TWIN: these mesh programs run as compute twins (drawn: {})", draws());
-                Named::Some(hashes)
-            }
+            if hashes.is_empty() { Named::Nothing } else { Named::Some(hashes) }
         }
-        Err(_) => Named::Nothing,
+        None if intel => Named::All,
+        None => Named::Nothing,
+    }
+}
+
+/// Whether the twins' triangles are drawn, from `VICTORY_MESH_TWIN_DRAW` (`1`: drawn, anything else:
+/// only the twin's dispatch runs, nothing is drawn) and, if that is unset, from the adapter: drawn on
+/// an Intel adapter when `VICTORY_MESH_TWIN` is unset too (the default there), not otherwise.
+fn draws_from(draw: Option<&str>, twin: Option<&str>, intel: bool) -> bool {
+    match draw {
+        Some(v) => v == "1",
+        None => intel && twin.is_none(),
+    }
+}
+
+fn named() -> &'static Named {
+    static NAMED: OnceLock<Named> = OnceLock::new();
+    NAMED.get_or_init(|| {
+        let value = std::env::var("VICTORY_MESH_TWIN").ok();
+        let named = named_from(value.as_deref(), crate::host::intel());
+        match &named {
+            Named::All if value.is_none() => tracing::info!(
+                "Intel adapter: the title's mesh draws run as compute twins, drawn by a vertex shader (VICTORY_MESH_TWIN=0 turns this off)"
+            ),
+            Named::All => {
+                tracing::warn!("VICTORY_MESH_TWIN=all: every mesh program runs as a compute twin (drawn: {})", draws())
+            }
+            Named::Some(hashes) => {
+                tracing::warn!(?hashes, "VICTORY_MESH_TWIN: these mesh programs run as compute twins (drawn: {})", draws())
+            }
+            Named::Nothing => {}
+        }
+        named
     })
 }
 
-/// Whether the twins' triangles are drawn (`VICTORY_MESH_TWIN_DRAW=1`).
+/// Whether the twins' triangles are drawn (`VICTORY_MESH_TWIN_DRAW=1`; the default on an Intel
+/// adapter, see [`draws_from`]).
 pub(crate) fn draws() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_TWIN_DRAW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let draw = std::env::var("VICTORY_MESH_TWIN_DRAW").ok();
+        let twin = std::env::var("VICTORY_MESH_TWIN").ok();
+        draws_from(draw.as_deref(), twin.as_deref(), crate::host::intel())
+    })
+}
+
+
+/// Whether any mesh program runs as a twin (what the pipelines made ahead of a run depend on).
+pub(crate) fn on() -> bool {
+    !matches!(named(), Named::Nothing)
+}
+
+/// Whether the mesh program with this hash runs as a twin.
+fn wanted_hash(hash: &str) -> bool {
+    match named() {
+        Named::Nothing => false,
+        Named::All => true,
+        Named::Some(hashes) => hashes.iter().any(|h| hash.starts_with(h.as_str())),
+    }
 }
 
 /// Whether the mesh pipeline `p` runs as a twin.
 pub(crate) fn wanted(p: &HostPipeline) -> bool {
-    if !p.mesh {
-        return false;
+    p.mesh && p.stages.first().is_some_and(|s| wanted_hash(&s.shader.hash))
+}
+
+/// Ahead of a run (`victory warm`): the twin of the mesh program among `shaders` and the pipeline
+/// that draws it with the title's pixel shader and state `g`, made so that the driver's cache holds
+/// them when a draw asks. Otherwise each is compiled at the first draw that wants it, in the middle
+/// of the world's first frames (the draw waits, or is dropped while it is made). True if there was
+/// nothing to make or all of it was made.
+pub(crate) fn warm(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> bool {
+    let Some(ms) = shaders.iter().find(|s| s.stage == "mesh") else {
+        return true;
+    };
+    if !wanted_hash(&ms.hash) {
+        return true;
     }
-    match named() {
-        Named::Nothing => false,
-        Named::All => true,
-        Named::Some(hashes) => p
-            .stages
-            .first()
-            .is_some_and(|s| hashes.iter().any(|h| s.shader.hash.starts_with(h.as_str()))),
-    }
+    let compute = HostPipeline::new(&[crate::pipeline::twin_of(ms)], None).is_some();
+    let drawn = match (draws(), g) {
+        (true, Some(g)) => {
+            let mut stages = vec![crate::pipeline::twin_vertex_of(ms)];
+            stages.extend(shaders.iter().find(|s| s.stage == "pixel").cloned());
+            HostPipeline::new_for(&stages, Some(g), true).is_some()
+        }
+        _ => true,
+    };
+    compute && drawn
 }
 
 /// What a mesh pipeline's twin is made of.
@@ -371,5 +434,35 @@ pub(crate) fn release(list: &ID3D12GraphicsCommandList) {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
         }
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn on_an_intel_adapter_the_twins_run_and_draw_by_default() {
+        assert!(matches!(named_from(None, true), Named::All));
+        assert!(draws_from(None, None, true));
+    }
+
+    #[test]
+    fn other_adapters_run_no_twins_unless_named() {
+        assert!(matches!(named_from(None, false), Named::Nothing));
+        assert!(!draws_from(None, None, false));
+        assert!(matches!(named_from(Some("all"), false), Named::All));
+        assert!(matches!(named_from(Some("05393503, 45ace412"), false), Named::Some(h) if h.len() == 2));
+    }
+
+    #[test]
+    fn the_setting_turns_the_twins_off_on_an_intel_adapter() {
+        for off in ["0", "off", "none", " 0 ", ""] {
+            assert!(matches!(named_from(Some(off), true), Named::Nothing), "{off:?}");
+        }
+        // an explicit setting without the draw switch is stage A: dispatch only
+        assert!(!draws_from(None, Some("all"), true));
+        assert!(draws_from(Some("1"), Some("all"), true));
+        assert!(!draws_from(Some("0"), None, true));
     }
 }

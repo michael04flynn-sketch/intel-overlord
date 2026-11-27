@@ -72,6 +72,13 @@ $experiments = [ordered]@{
     'twin'         = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all' } }
     'twin-draw'    = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all'; VICTORY_MESH_TWIN_DRAW = '1' } }
     'twin-shadows' = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = '05393503e72397a3,45ace4127ac61cfd,d42a640660651285,f507ff49d4aadd4b'; VICTORY_MESH_TWIN_DRAW = '1' } }
+    # Lighting with the compute twin drawing the meshes. Without the structure builder the title's screen
+    # probes find no rays (blocks of stale light on the ground, black indoors); VICTORY_AMBIENT is the
+    # stand-in for that light (ambient.rs): a share of an estimate worked out from the frame.
+    # _AIR bounds what the air scatters (a brown veil indoors at sunset), _SHADE the creases.
+    'twin-amb'     = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all'; VICTORY_MESH_TWIN_DRAW = '1'; VICTORY_AMBIENT = '1' } }
+    'twin-amb08'   = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all'; VICTORY_MESH_TWIN_DRAW = '1'; VICTORY_AMBIENT = '0.8' } }
+    'twin-amb-air' = @{ MeshTest = 'skip'; More = @{ VICTORY_MESH_TWIN = 'all'; VICTORY_MESH_TWIN_DRAW = '1'; VICTORY_AMBIENT = '1'; VICTORY_AMBIENT_AIR = '2' } }
     # nothing is ever let go (host copies of title buffers and textures stay): if the hang goes, a view in
     # the heap that a shader picks by an index reads memory the host had given back
     'no-sweep'     = @{ More = @{ VICTORY_SWEEP = '0'; VICTORY_TEXTURE_SWEEP = '0' } }

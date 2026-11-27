@@ -109,7 +109,11 @@ param(
     # and, once the world starts (a frame of 500 draws), its 2nd, 6th, 30th, 80th and some later ones
     # (VICTORY_CAPTURE, VICTORY_CAPTURE_WORLD; diag build). To see with your own eyes what is textured and
     # what is not, without sitting at the screen for the 2 minutes of the world.
-    [switch]$Capture
+    [switch]$Capture,
+    # Run scripts\preload-intel.ps1 first (shaders translated, pipelines compiled by the driver, small archives
+    # read: what the game otherwise does in its first minutes). It skips what is up to date, so after the
+    # first time it takes seconds.
+    [switch]$Preload
 )
 
 $profiles = @{
@@ -152,6 +156,9 @@ $lowMemory = @{
     VICTORY_RESIDENCY                 = '1'
     # Smaller-PC budgets on any PC. Needs VICTORY_RESIDENCY=1, which is set above.
     VICTORY_RESIDENCY_LIMITED         = '1'
+    # The pipelines the title creates are written down (cache folder, not the repository), which is what
+    # scripts\preload-intel.ps1 compiles ahead of the next run.
+    VICTORY_PIPELINE_BOOK             = '1'
 }
 
 # -InPlace: title memory outside buffers is opened as a host heap and used where the title wrote
@@ -213,6 +220,11 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 $Exe = (Resolve-Path $Exe).Path
+
+if ($Preload) {
+    & (Join-Path $PSScriptRoot 'preload-intel.ps1') -Exe $Exe -Build $Build
+    if ($LASTEXITCODE -ne 0) { Write-Host 'The preload did not finish (see above); starting anyway.' }
+}
 
 # Memory pre-flight. On this kind of PC the card's budget is system memory, and the title's
 # first world frame grows the process by several GB at once (runs 6 to 8 ended with under

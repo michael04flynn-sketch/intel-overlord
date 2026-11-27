@@ -29,8 +29,17 @@ making the 28 compute programs run in waves of 32 is translator work still to do
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
+.\scripts\preload-intel.ps1 -Exe 'C:\path\to\game_scarlett_master.exe'    # once; minutes the first time
 .\scripts\play-intel-lowmem.ps1 -Exe 'C:\path\to\game_scarlett_master.exe'
 ```
+
+`preload-intel.ps1` does ahead of time what the game otherwise does in its first minutes: it translates every
+shader of the game into the host's cache, has the driver compile the pipelines earlier runs drew with (on
+Intel that includes the mesh programs' compute twins and the pipelines that draw them, and the lighting
+passes), and reads the game's small archives into the PC's file cache. It skips what is up to date (a stamp
+per build, driver and game version), so after the first time it takes seconds. `play-intel-lowmem.ps1 -Preload`
+runs it first. It cannot preload textures: they are made on the card from the game's own memory while it
+runs; what helps them is free RAM and no draw waiting for a compile.
 
 The launcher prints its settings, writes a log and a memory timeline to `logs\`, and
 refuses to start under a free-RAM floor (`-MinFreeGB`). Profiles (`-Profile`, world

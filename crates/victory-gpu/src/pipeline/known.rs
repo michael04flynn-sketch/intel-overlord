@@ -254,6 +254,9 @@ pub fn fingerprint() -> String {
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    // (After the host: whether mesh programs run as twins depends on the adapter.) The twins and
+    // their drawing pipelines are made with the others, so a change in it makes the old ones stale.
+    h.update(&[u8::from(crate::twin::on())]);
     h.finalize().to_hex()[..16].to_owned()
 }
 
@@ -290,7 +293,15 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         each(*n, None);
         let began = std::time::Instant::now();
         let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+            .and_then(|(shaders, g)| {
+                let host = HostPipeline::new(&shaders, g.as_deref());
+                // A mesh program that runs as a compute twin (`twin.rs`): the twin and the pipeline
+                // that draws it are what the title's draws ask for, so they are made here as well.
+                if host.is_some() && !crate::twin::warm(&shaders, g.as_deref()) {
+                    tracing::warn!(key = %entry.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect::<String>(), "a mesh program's compute twin or its drawing pipeline was not made");
+                }
+                host
+            })
             .is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
